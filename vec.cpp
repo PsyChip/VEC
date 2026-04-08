@@ -321,6 +321,8 @@ static int vec_pull(const float* h_query, int* out_ids, float* out_dists)
 
 static void save_to_file()
 {
+    if (g_count == 0) { printf("nothing to save\n"); return; }
+
     char path[512];
     snprintf(path, sizeof(path), "%s.tensors", g_name);
 
@@ -529,8 +531,22 @@ static int process_command(const char* line, int line_len,
         return 0;
     }
 
+    if (line_len >= 4 && strncmp(line, "undo", 4) == 0) {
+        if (g_count == 0) {
+            rlen = snprintf(resp, sizeof(resp), "err empty\n");
+            writer(wctx, resp, rlen);
+            return 0;
+        }
+        g_count--;
+        if (!g_alive[g_count]) g_deleted--;
+        g_alive[g_count] = 1;
+        rlen = snprintf(resp, sizeof(resp), "ok\n");
+        writer(wctx, resp, rlen);
+        return 0;
+    }
+
     if (line_len >= 4 && strncmp(line, "size", 4) == 0) {
-        rlen = snprintf(resp, sizeof(resp), "%d\n", g_count - g_deleted);
+        rlen = snprintf(resp, sizeof(resp), "%d\n", g_count);
         writer(wctx, resp, rlen);
         return 0;
     }
