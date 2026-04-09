@@ -3,12 +3,12 @@
  * root@psychip.net
  * April 2026
  *
- * box — dead simple memory-resident string store
+ * box - dead simple memory-resident string store
  *
  * Usage:  box <name> [slot_size] [port]
  *
  * Allocates fixed-size UTF-8 string slots in system RAM.
- * Companion to vec — same index space, same append-only model.
+ * Companion to vec - same index space, same append-only model.
  *
  * Listens on:
  *   - TCP port (default 2020)

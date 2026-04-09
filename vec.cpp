@@ -3,32 +3,32 @@
  * root@psychip.net
  * April 2026
  *
- * vec — dead simple GPU-resident vector database (host code, fp16 storage)
+ * vec - dead simple GPU-resident vector database (host code, fp32)
  *
  * Usage:  vec <name> <dim> [port]
  *
- * Creates an in-memory CUDA vector store with fp16 storage.
- * Accepts fp32 input, converts to fp16 on GPU. Queries return fp32.
- *
+ * Creates an in-memory CUDA vector store.
  * Listens on:
  *   - TCP port (default 1920)
  *   - Named pipe: \\.\pipe\vec_<name>
  *
- * Text protocol (TCP & pipe):
+ * Protocol (TCP & pipe):
  *   push 1.0,2.0,3.0,...\n        -> returns slot index
- *   pull 1.0,2.0,3.0,...\n        -> returns top 10 nearest (index:distance,...)
+ *   pull 1.0,2.0,3.0,...\n        -> top 10 nearest by L2 distance (index:distance,...)
+ *   cpull 1.0,2.0,3.0,...\n       -> top 10 nearest by cosine distance
  *   bpush <N>\n<N*dim*4 bytes>    -> binary bulk push (fp32), returns first slot index
  *   delete <index>\n              -> tombstone a vector
+ *   undo\n                         -> remove last pushed vector
  *   save\n                         -> flush to <name>.tensors
- *   size\n                         -> returns active vector count
+ *   size\n                         -> returns total index count
  *
  * File format (.tensors):
- *   [4B dim][4B count][4B deleted][count bytes alive mask][count*dim*2B fp16 data]
+ *   [4B dim][4B count][4B deleted][count B alive mask][count*dim*4B fp32 data]
  *
  * Ctrl+C saves before exit.
  *
- * Build (Windows, Ampere+):
- *   nvcc -O3 vec_kernel.cu vec.cpp -o vec.exe -lws2_32 -arch=sm_86
+ * Build (Windows):
+ *   nvcc -O2 vec_kernel.cu vec.cpp -o vec.exe -lws2_32 -arch=sm_86
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -57,16 +57,11 @@
 /*  External kernels (vec_kernel.cu)                                   */
 /* ------------------------------------------------------------------ */
 
-/* half is typedef'd in cuda_fp16.h but we can't include that here
-   (Win32 header conflict). Use unsigned short as the host-side alias
-   — same size, same layout, no fp16 math needed on host. */
-typedef unsigned short half_t;
-
 extern "C" {
-void launch_l2_dist(const half_t* db, const half_t* query,
+void launch_l2_dist(const float* db, const float* query,
                     float* dists, int n, int dim);
-void launch_f32_to_f16(const float* src, half_t* dst, int count);
-void launch_f16_to_f32(const half_t* src, float* dst, int count);
+void launch_cos_dist(const float* db, const float* query,
+                     float* dists, int n, int dim);
 }
 
 /* ------------------------------------------------------------------ */
@@ -79,15 +74,13 @@ static int  g_port       = DEFAULT_PORT;
 static int  g_count      = 0;
 static int  g_capacity   = 0;
 
-static half_t* d_vectors = NULL;   /* GPU fp16 [capacity * dim] */
-static half_t* d_query   = NULL;   /* GPU fp16 [dim]            */
-static float*  d_dists   = NULL;   /* GPU fp32 [capacity]       */
-static float*  d_staging = NULL;   /* GPU fp32 temp for conversion */
-static int     d_staging_n = 0;
+static float* d_vectors  = NULL;   /* GPU fp32 [capacity * dim] */
+static float* d_query    = NULL;   /* GPU fp32 [dim]            */
+static float* d_dists    = NULL;   /* GPU fp32 [capacity]       */
 
 static float* h_dists    = NULL;
 static int*   h_ids      = NULL;
-static float* h_pinned   = NULL;   /* pinned fp32 host staging */
+static float* h_pinned   = NULL;   /* pinned host staging */
 static int    h_pinned_n = 0;
 
 static unsigned char* g_alive = NULL;
@@ -146,14 +139,6 @@ static void release_instance_lock()
 /*  GPU memory management                                              */
 /* ------------------------------------------------------------------ */
 
-static void gpu_ensure_staging(int nfloats)
-{
-    if (nfloats <= d_staging_n) return;
-    if (d_staging) CUDA_CHECK(cudaFree(d_staging));
-    d_staging_n = nfloats;
-    CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
-}
-
 static void gpu_realloc_if_needed(int required)
 {
     if (required <= g_capacity) return;
@@ -161,11 +146,11 @@ static void gpu_realloc_if_needed(int required)
     int new_cap = g_capacity;
     while (new_cap < required) new_cap *= 2;
 
-    half_t* d_new;
-    CUDA_CHECK(cudaMalloc(&d_new, (size_t)new_cap * g_dim * sizeof(half_t)));
+    float* d_new;
+    CUDA_CHECK(cudaMalloc(&d_new, (size_t)new_cap * g_dim * sizeof(float)));
     if (d_vectors && g_count > 0) {
         CUDA_CHECK(cudaMemcpy(d_new, d_vectors,
-                              (size_t)g_count * g_dim * sizeof(half_t),
+                              (size_t)g_count * g_dim * sizeof(float),
                               cudaMemcpyDeviceToDevice));
     }
     if (d_vectors) CUDA_CHECK(cudaFree(d_vectors));
@@ -189,13 +174,9 @@ static void gpu_realloc_if_needed(int required)
 static void gpu_init()
 {
     g_capacity = INITIAL_CAP;
-    CUDA_CHECK(cudaMalloc(&d_vectors, (size_t)g_capacity * g_dim * sizeof(half_t)));
-    CUDA_CHECK(cudaMalloc(&d_query,   g_dim * sizeof(half_t)));
+    CUDA_CHECK(cudaMalloc(&d_vectors, (size_t)g_capacity * g_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_query,   g_dim * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dists,   g_capacity * sizeof(float)));
-
-    /* staging buffer for fp32->fp16 conversion */
-    d_staging_n = 1024 * g_dim;
-    CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
 
     h_dists = (float*)malloc(g_capacity * sizeof(float));
     h_ids   = (int*)malloc(g_capacity * sizeof(int));
@@ -221,7 +202,6 @@ static void gpu_shutdown()
     if (d_vectors) cudaFree(d_vectors);
     if (d_query)   cudaFree(d_query);
     if (d_dists)   cudaFree(d_dists);
-    if (d_staging) cudaFree(d_staging);
     if (h_pinned)  cudaFreeHost(h_pinned);
     free(h_dists); free(h_ids); free(g_alive);
 }
@@ -230,70 +210,49 @@ static void gpu_shutdown()
 /*  Vector operations                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Push one vector: fp32 host -> fp32 GPU staging -> fp16 GPU storage */
 static int vec_push(const float* h_vec)
 {
     gpu_realloc_if_needed(g_count + 1);
-    gpu_ensure_staging(g_dim);
-
     int slot = g_count;
-
-    /* upload fp32 to GPU staging */
-    CUDA_CHECK(cudaMemcpy(d_staging, h_vec, g_dim * sizeof(float),
-                          cudaMemcpyHostToDevice));
-
-    /* convert fp32 -> fp16 directly into storage */
-    launch_f32_to_f16(d_staging, d_vectors + (size_t)slot * g_dim, g_dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
+    CUDA_CHECK(cudaMemcpy(d_vectors + (size_t)slot * g_dim, h_vec,
+                          g_dim * sizeof(float), cudaMemcpyHostToDevice));
     g_count++;
     return slot;
 }
 
-/* Bulk push: fp32 data already in h_pinned */
 static int vec_bpush(int n)
 {
     gpu_realloc_if_needed(g_count + n);
-
-    int total_floats = n * g_dim;
-    gpu_ensure_staging(total_floats);
-
     int first = g_count;
-
-    /* upload fp32 to GPU staging */
-    CUDA_CHECK(cudaMemcpy(d_staging, h_pinned, total_floats * sizeof(float),
+    CUDA_CHECK(cudaMemcpy(d_vectors + (size_t)first * g_dim, h_pinned,
+                          (size_t)n * g_dim * sizeof(float),
                           cudaMemcpyHostToDevice));
-
-    /* convert fp32 -> fp16 into storage */
-    launch_f32_to_f16(d_staging, d_vectors + (size_t)first * g_dim, total_floats);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
     g_count += n;
     return first;
 }
 
-/* Query: fp32 host -> convert to fp16 -> L2 kernel -> fp32 distances */
-static int vec_pull(const float* h_query, int* out_ids, float* out_dists)
+/* mode: 0=L2, 1=cosine */
+static int vec_pull(const float* h_query, int* out_ids, float* out_dists, int mode)
 {
     int alive = g_count - g_deleted;
     if (alive <= 0) return 0;
     int n = g_count;
     int k = (alive < TOP_K) ? alive : TOP_K;
 
-    /* upload query fp32 to staging, convert to fp16 */
-    gpu_ensure_staging(g_dim);
-    CUDA_CHECK(cudaMemcpy(d_staging, h_query, g_dim * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    launch_f32_to_f16(d_staging, d_query, g_dim);
+    cudaGetLastError(); /* clear any stale errors */
 
-    /* compute L2 distances (fp16 math, fp32 output) */
-    launch_l2_dist(d_vectors, d_query, d_dists, n, g_dim);
+    CUDA_CHECK(cudaMemcpy(d_query, h_query, g_dim * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    if (mode == 1)
+        launch_cos_dist(d_vectors, d_query, d_dists, n, g_dim);
+    else
+        launch_l2_dist(d_vectors, d_query, d_dists, n, g_dim);
 
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_dists, d_dists, n * sizeof(float),
                           cudaMemcpyDeviceToHost));
 
-    /* mark deleted slots with max distance */
     for (int i = 0; i < n; i++) {
         h_ids[i] = i;
         if (!g_alive[i]) h_dists[i] = 3.402823e+38f;
@@ -316,7 +275,7 @@ static int vec_pull(const float* h_query, int* out_ids, float* out_dists)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Persistence — stores fp16 on disk                                  */
+/*  Persistence                                                        */
 /* ------------------------------------------------------------------ */
 
 static void save_to_file()
@@ -336,17 +295,14 @@ static void save_to_file()
     if (g_count > 0) {
         fwrite(g_alive, 1, g_count, f);
 
-        /* download fp16 data directly from GPU */
-        size_t total_bytes = (size_t)g_count * g_dim * sizeof(half_t);
-        half_t* h_buf = (half_t*)malloc(total_bytes);
-        CUDA_CHECK(cudaMemcpy(h_buf, d_vectors, total_bytes,
+        size_t total = (size_t)g_count * g_dim;
+        gpu_ensure_pinned((int)total);
+        CUDA_CHECK(cudaMemcpy(h_pinned, d_vectors, total * sizeof(float),
                               cudaMemcpyDeviceToHost));
-        fwrite(h_buf, sizeof(half_t), (size_t)g_count * g_dim, f);
-        free(h_buf);
+        fwrite(h_pinned, sizeof(float), total, f);
     }
     fclose(f);
-    printf("saved %d vectors (%d deleted) to %s [fp16]\n",
-           g_count, g_deleted, path);
+    printf("saved %d vectors (%d deleted) to %s\n", g_count, g_deleted, path);
 }
 
 static int load_from_file()
@@ -382,29 +338,25 @@ static int load_from_file()
             file_count = (int)mask_rd;
         }
 
-        /* read fp16 data directly */
-        size_t total_halfs = (size_t)file_count * g_dim;
-        half_t* h_buf = (half_t*)malloc(total_halfs * sizeof(half_t));
+        size_t total = (size_t)file_count * g_dim;
+        gpu_ensure_pinned((int)total);
 
-        size_t rd = fread(h_buf, sizeof(half_t), total_halfs, f);
-        if (rd != total_halfs) {
-            fprintf(stderr, "WARN: expected %llu halfs, got %llu\n",
-                    (unsigned long long)total_halfs, (unsigned long long)rd);
+        size_t rd = fread(h_pinned, sizeof(float), total, f);
+        if (rd != total) {
+            fprintf(stderr, "WARN: expected %llu floats, got %llu\n",
+                    (unsigned long long)total, (unsigned long long)rd);
             file_count = (int)(rd / g_dim);
         }
 
-        CUDA_CHECK(cudaMemcpy(d_vectors, h_buf,
-                              (size_t)file_count * g_dim * sizeof(half_t),
+        CUDA_CHECK(cudaMemcpy(d_vectors, h_pinned,
+                              (size_t)file_count * g_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
-        free(h_buf);
-
         g_count   = file_count;
         g_deleted = file_deleted;
     }
 
     fclose(f);
-    printf("loaded %d vectors (%d deleted) from %s [fp16]\n",
-           g_count, g_deleted, path);
+    printf("loaded %d vectors (%d deleted) from %s\n", g_count, g_deleted, path);
     return 1;
 }
 
@@ -479,9 +431,17 @@ static int process_command(const char* line, int line_len,
         return 0;
     }
 
+    /* pull (L2) or cpull (cosine) */
+    int pull_mode = -1;
+    int pull_offset = 0;
     if (line_len > 5 && strncmp(line, "pull ", 5) == 0) {
+        pull_mode = 0; pull_offset = 5;
+    } else if (line_len > 6 && strncmp(line, "cpull ", 6) == 0) {
+        pull_mode = 1; pull_offset = 6;
+    }
+    if (pull_mode >= 0) {
         float* vals = (float*)malloc(g_dim * sizeof(float));
-        int n = parse_floats(line + 5, vals, g_dim);
+        int n = parse_floats(line + pull_offset, vals, g_dim);
         if (n != g_dim) {
             rlen = snprintf(resp, sizeof(resp),
                             "err dim mismatch: got %d, expected %d\n", n, g_dim);
@@ -491,7 +451,7 @@ static int process_command(const char* line, int line_len,
         }
         int ids[TOP_K];
         float dists[TOP_K];
-        int k = vec_pull(vals, ids, dists);
+        int k = vec_pull(vals, ids, dists, pull_mode);
         free(vals);
 
         char* p = resp;
@@ -524,13 +484,6 @@ static int process_command(const char* line, int line_len,
         return 0;
     }
 
-    if (line_len >= 4 && strncmp(line, "save", 4) == 0) {
-        save_to_file();
-        rlen = snprintf(resp, sizeof(resp), "ok\n");
-        writer(wctx, resp, rlen);
-        return 0;
-    }
-
     if (line_len >= 4 && strncmp(line, "undo", 4) == 0) {
         if (g_count == 0) {
             rlen = snprintf(resp, sizeof(resp), "err empty\n");
@@ -540,6 +493,13 @@ static int process_command(const char* line, int line_len,
         g_count--;
         if (!g_alive[g_count]) g_deleted--;
         g_alive[g_count] = 1;
+        rlen = snprintf(resp, sizeof(resp), "ok\n");
+        writer(wctx, resp, rlen);
+        return 0;
+    }
+
+    if (line_len >= 4 && strncmp(line, "save", 4) == 0) {
+        save_to_file();
         rlen = snprintf(resp, sizeof(resp), "ok\n");
         writer(wctx, resp, rlen);
         return 0;
@@ -824,11 +784,9 @@ static void generate_random_name(char* buf, int len)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        /* no args: random name, 1024 dim, default port */
         generate_random_name(g_name, 6);
         g_dim = 1024;
     } else if (argc < 3) {
-        /* just name: default dim */
         strncpy(g_name, argv[1], sizeof(g_name) - 1);
         g_dim = 1024;
     } else {
@@ -853,7 +811,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    printf("name=%s dim=%d port=%d storage=fp16\n", g_name, g_dim, g_port);
+    printf("name=%s dim=%d port=%d storage=fp32\n", g_name, g_dim, g_port);
 
     int device;
     cudaGetDevice(&device);
@@ -863,6 +821,7 @@ int main(int argc, char** argv)
            prop.totalGlobalMem / (1024.0 * 1024.0));
 
     gpu_init();
+    cudaGetLastError(); /* clear any init-time errors */
 
     int lr = load_from_file();
     if (lr < 0) {
