@@ -26,11 +26,10 @@
 #include <time.h>
 
 #define DEFAULT_PORT 1920
-#define NUM_VECTORS  50
+#define NUM_VECTORS  1000
 #define BUF_SIZE     (1 << 20)
 
-static int sock_readline(SOCKET s, char* buf, int buf_size)
-{
+static int sock_readline(SOCKET s, char *buf, int buf_size) {
     int total = 0;
     while (total < buf_size - 1) {
         int r = recv(s, buf + total, 1, 0);
@@ -42,21 +41,18 @@ static int sock_readline(SOCKET s, char* buf, int buf_size)
     return total;
 }
 
-static int sock_command(SOCKET s, const char* cmd, char* resp, int resp_size)
-{
+static int sock_command(SOCKET s, const char *cmd, char *resp, int resp_size) {
     int len = (int)strlen(cmd);
     send(s, cmd, len, 0);
     return sock_readline(s, resp, resp_size);
 }
 
-static float randf()
-{
+static float randf() {
     return ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
 }
 
-static void build_query_cmd(char* cmd, const char* prefix, const float* query, int dim)
-{
-    char* p = cmd;
+static void build_query_cmd(char *cmd, const char *prefix, const float *query, int dim) {
+    char *p = cmd;
     p += sprintf(p, "%s ", prefix);
     for (int d = 0; d < dim; d++) {
         if (d > 0) *p++ = ',';
@@ -66,8 +62,7 @@ static void build_query_cmd(char* cmd, const char* prefix, const float* query, i
     *p = '\0';
 }
 
-static void print_results(const char* resp, int pick)
-{
+static void print_results(const char *resp, int pick) {
     char buf[4096];
     strncpy(buf, resp, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -76,27 +71,25 @@ static void print_results(const char* resp, int pick)
     printf("  ----  --------  ----------\n");
 
     int rank = 1;
-    char* tok = strtok(buf, ",\n");
+    char *tok = strtok(buf, ",\n");
     while (tok) {
         int idx;
         float dist;
         if (sscanf(tok, "%d:%f", &idx, &dist) == 2) {
-            printf("  %4d  %8d  %.6f%s\n", rank, idx, dist,
-                   idx == pick ? "  <-- MATCH" : "");
+            printf("  %4d  %8d  %.6f%s\n", rank, idx, dist, idx == pick ? "  <-- MATCH" : "");
             rank++;
         }
         tok = strtok(NULL, ",\n");
     }
 }
 
-int main(int argc, char** argv)
-{
+int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: test <name> <dim> [port]\n");
         return 1;
     }
 
-    const char* name = argv[1];
+    const char *name = argv[1];
     int dim = atoi(argv[2]);
     int port = DEFAULT_PORT;
     if (argc >= 4) port = atoi(argv[3]);
@@ -109,24 +102,18 @@ int main(int argc, char** argv)
     printf("name=%s dim=%d port=%d vectors=%d\n", name, dim, port, NUM_VECTORS);
     srand((unsigned)time(NULL));
 
-    /* generate random vectors */
     size_t total_floats = (size_t)NUM_VECTORS * dim;
-    float* vectors = (float*)malloc(total_floats * sizeof(float));
-    for (size_t i = 0; i < total_floats; i++)
-        vectors[i] = randf();
+    float *vectors = (float *)malloc(total_floats * sizeof(float));
+    for (size_t i = 0; i < total_floats; i++) vectors[i] = randf();
 
-    /* pick one to query later */
     int pick = rand() % NUM_VECTORS;
-    float* query = (float*)malloc(dim * sizeof(float));
+    float *query = (float *)malloc(dim * sizeof(float));
     memcpy(query, vectors + (size_t)pick * dim, dim * sizeof(float));
 
-    /* add tiny noise */
-    for (int d = 0; d < dim; d++)
-        query[d] += randf() * 0.0001f;
+    for (int d = 0; d < dim; d++) query[d] += randf() * 0.0001f;
 
     printf("query is noisy copy of vector #%d\n\n", pick);
 
-    /* connect */
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
@@ -142,7 +129,7 @@ int main(int argc, char** argv)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((unsigned short)port);
 
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         fprintf(stderr, "ERROR: connect() failed - is vec running on port %d?\n", port);
         closesocket(s);
         WSACleanup();
@@ -150,17 +137,16 @@ int main(int argc, char** argv)
     }
     printf("connected to 127.0.0.1:%d\n", port);
 
-    char* cmd = (char*)malloc(BUF_SIZE);
+    char *cmd = (char *)malloc(BUF_SIZE);
     char resp[4096];
 
-    /* push all vectors */
     printf("pushing %d vectors...\n", NUM_VECTORS);
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
     for (int i = 0; i < NUM_VECTORS; i++) {
-        char* p = cmd;
+        char *p = cmd;
         p += sprintf(p, "push ");
         for (int d = 0; d < dim; d++) {
             if (d > 0) *p++ = ',';
@@ -168,9 +154,7 @@ int main(int argc, char** argv)
         }
         *p++ = '\n';
         *p = '\0';
-
         sock_command(s, cmd, resp, sizeof(resp));
-
         if (strncmp(resp, "err", 3) == 0) {
             fprintf(stderr, "ERROR on push %d: %s", i, resp);
             goto done;
@@ -178,8 +162,7 @@ int main(int argc, char** argv)
     }
 
     QueryPerformanceCounter(&t1);
-    printf("pushed %d vectors in %.1f ms\n\n", NUM_VECTORS,
-           (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+    printf("pushed %d vectors in %.1f ms\n\n", NUM_VECTORS, (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
 
     build_query_cmd(cmd, "pull", query, dim);
     printf("[L2] pull:\n");
@@ -187,8 +170,7 @@ int main(int argc, char** argv)
     sock_command(s, cmd, resp, sizeof(resp));
     QueryPerformanceCounter(&t1);
     print_results(resp, pick);
-    printf("  time: %.3f ms\n\n",
-           (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+    printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
 
     build_query_cmd(cmd, "cpull", query, dim);
     printf("[COSINE] cpull:\n");
@@ -196,8 +178,7 @@ int main(int argc, char** argv)
     sock_command(s, cmd, resp, sizeof(resp));
     QueryPerformanceCounter(&t1);
     print_results(resp, pick);
-    printf("  time: %.3f ms\n\n",
-           (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+    printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
 
     sock_command(s, "size\n", resp, sizeof(resp));
     printf("size: %s", resp);
@@ -208,7 +189,6 @@ done:
     free(vectors);
     free(query);
     free(cmd);
-
     printf("done.\n");
     return 0;
 }

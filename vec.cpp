@@ -3,9 +3,10 @@
  * root@psychip.net
  * April 2026
  *
- * vec - dead simple GPU-resident vector database (host code, fp32)
+ * vec - dead simple GPU-resident vector database (host code)
  *
- * Usage:  vec <name> <dim> [port]
+ * Usage:  vec <name> <dim[:format]> [port]
+ *         format: f32 (default), f16
  *
  * Creates an in-memory CUDA vector store.
  * Listens on:
@@ -14,21 +15,18 @@
  *
  * Protocol (TCP & pipe):
  *   push 1.0,2.0,3.0,...\n        -> returns slot index
- *   pull 1.0,2.0,3.0,...\n        -> top 10 nearest by L2 distance (index:distance,...)
+ *   pull 1.0,2.0,3.0,...\n        -> top 10 nearest by L2 distance
  *   cpull 1.0,2.0,3.0,...\n       -> top 10 nearest by cosine distance
  *   bpush <N>\n<N*dim*4 bytes>    -> binary bulk push (fp32), returns first slot index
  *   delete <index>\n              -> tombstone a vector
- *   undo\n                         -> remove last pushed vector
- *   save\n                         -> flush to <name>.tensors
- *   size\n                         -> returns total index count
+ *   undo\n                        -> remove last pushed vector
+ *   save\n                        -> flush to <name>.tensors
+ *   size\n                        -> returns total index count
  *
  * File format (.tensors):
- *   [4B dim][4B count][4B deleted][count B alive mask][count*dim*4B fp32 data]
+ *   [4B dim][4B count][4B deleted][1B format][count B alive mask][vector data]
  *
  * Ctrl+C saves before exit.
- *
- * Build (Windows):
- *   nvcc -O2 vec_kernel.cu vec.cpp -o vec.exe -lws2_32 -arch=sm_86
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -38,80 +36,67 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #include <cuda_runtime.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ------------------------------------------------------------------ */
-/*  Config                                                             */
-/* ------------------------------------------------------------------ */
+#define DEFAULT_PORT 1920
+#define TOP_K 10
+#define INITIAL_CAP 4096
+#define MAX_LINE (1 << 20)
+#define PIPE_BUF_SIZE (1 << 16)
 
-#define DEFAULT_PORT    1920
-#define TOP_K           10
-#define INITIAL_CAP     4096
-#define MAX_LINE        (1 << 20)
-#define PIPE_BUF_SIZE   (1 << 16)
-
-/* ------------------------------------------------------------------ */
-/*  External kernels (vec_kernel.cu)                                   */
-/* ------------------------------------------------------------------ */
+#define FMT_F32 0
+#define FMT_F16 1
 
 extern "C" {
-void launch_l2_dist(const float* db, const float* query,
-                    float* dists, int n, int dim);
-void launch_cos_dist(const float* db, const float* query,
-                     float* dists, int n, int dim);
+    void launch_l2_f32(const float *db, const float *query, float *dists, int n, int dim);
+    void launch_cos_f32(const float *db, const float *query, float *dists, int n, int dim);
+    void launch_l2_f16(const void *db, const void *query, float *dists, int n, int dim);
+    void launch_cos_f16(const void *db, const void *query, float *dists, int n, int dim);
+    void launch_f32_to_f16(const float *src, void *dst, int count);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Globals                                                            */
-/* ------------------------------------------------------------------ */
-
 static char g_name[256];
-static int  g_dim        = 0;
-static int  g_port       = DEFAULT_PORT;
-static int  g_count      = 0;
-static int  g_capacity   = 0;
+static char g_filepath[512];
+static int g_dim = 0;
+static int g_port = DEFAULT_PORT;
+static int g_fmt = FMT_F32;
+static int g_elem_size = 4;
 
-static float* d_vectors  = NULL;   /* GPU fp32 [capacity * dim] */
-static float* d_query    = NULL;   /* GPU fp32 [dim]            */
-static float* d_dists    = NULL;   /* GPU fp32 [capacity]       */
+static const char *fmt_name(int fmt) { return fmt == FMT_F16 ? "f16" : "f32"; }
+static int g_count = 0;
+static int g_capacity = 0;
 
-static float* h_dists    = NULL;
-static int*   h_ids      = NULL;
-static float* h_pinned   = NULL;   /* pinned host staging */
-static int    h_pinned_n = 0;
+static void *d_vectors = NULL;
+static void *d_query = NULL;
+static float *d_dists = NULL;
+static float *d_staging = NULL;
+static int d_staging_n = 0;
 
-static unsigned char* g_alive = NULL;
-static int    g_alive_cap = 0;
-static int    g_deleted   = 0;
+static float *h_dists = NULL;
+static int *h_ids = NULL;
+static float *h_pinned = NULL;
+static int h_pinned_n = 0;
+
+static unsigned char *g_alive = NULL;
+static int g_alive_cap = 0;
+static int g_deleted = 0;
 
 static volatile int g_running = 1;
-static HANDLE       g_mutex   = NULL;
-
-/* ------------------------------------------------------------------ */
-/*  CUDA helpers                                                       */
-/* ------------------------------------------------------------------ */
+static HANDLE g_mutex = NULL;
 
 #define CUDA_CHECK(x) do { \
     cudaError_t err = (x); \
     if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, \
-                cudaGetErrorString(err)); \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
         exit(1); \
     } \
 } while(0)
 
-/* ------------------------------------------------------------------ */
-/*  Instance guard: named mutex                                        */
-/* ------------------------------------------------------------------ */
-
-static int acquire_instance_lock()
-{
+static int acquire_instance_lock() {
     char mutex_name[512];
     snprintf(mutex_name, sizeof(mutex_name), "Global\\vec_%s", g_name);
-
     g_mutex = CreateMutexA(NULL, TRUE, mutex_name);
     if (g_mutex == NULL) {
         fprintf(stderr, "ERROR: failed to create mutex: %lu\n", GetLastError());
@@ -126,8 +111,7 @@ static int acquire_instance_lock()
     return 1;
 }
 
-static void release_instance_lock()
-{
+static void release_instance_lock() {
     if (g_mutex) {
         ReleaseMutex(g_mutex);
         CloseHandle(g_mutex);
@@ -135,23 +119,22 @@ static void release_instance_lock()
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  GPU memory management                                              */
-/* ------------------------------------------------------------------ */
+static void gpu_ensure_staging(int nfloats) {
+    if (nfloats <= d_staging_n) return;
+    if (d_staging) CUDA_CHECK(cudaFree(d_staging));
+    d_staging_n = nfloats;
+    CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
+}
 
-static void gpu_realloc_if_needed(int required)
-{
+static void gpu_realloc_if_needed(int required) {
     if (required <= g_capacity) return;
-
     int new_cap = g_capacity;
     while (new_cap < required) new_cap *= 2;
 
-    float* d_new;
-    CUDA_CHECK(cudaMalloc(&d_new, (size_t)new_cap * g_dim * sizeof(float)));
+    void *d_new;
+    CUDA_CHECK(cudaMalloc(&d_new, (size_t)new_cap * g_dim * g_elem_size));
     if (d_vectors && g_count > 0) {
-        CUDA_CHECK(cudaMemcpy(d_new, d_vectors,
-                              (size_t)g_count * g_dim * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(d_new, d_vectors, (size_t)g_count * g_dim * g_elem_size, cudaMemcpyDeviceToDevice));
     }
     if (d_vectors) CUDA_CHECK(cudaFree(d_vectors));
     d_vectors = d_new;
@@ -159,99 +142,103 @@ static void gpu_realloc_if_needed(int required)
     if (d_dists) CUDA_CHECK(cudaFree(d_dists));
     CUDA_CHECK(cudaMalloc(&d_dists, new_cap * sizeof(float)));
 
-    free(h_dists); free(h_ids);
-    h_dists = (float*)malloc(new_cap * sizeof(float));
-    h_ids   = (int*)malloc(new_cap * sizeof(int));
+    free(h_dists);
+    free(h_ids);
+    h_dists = (float *)malloc(new_cap * sizeof(float));
+    h_ids = (int *)malloc(new_cap * sizeof(int));
 
-    unsigned char* new_alive = (unsigned char*)realloc(g_alive, new_cap);
+    unsigned char *new_alive = (unsigned char *)realloc(g_alive, new_cap);
     memset(new_alive + g_alive_cap, 1, new_cap - g_alive_cap);
     g_alive = new_alive;
     g_alive_cap = new_cap;
-
     g_capacity = new_cap;
 }
 
-static void gpu_init()
-{
+static void gpu_init() {
     g_capacity = INITIAL_CAP;
-    CUDA_CHECK(cudaMalloc(&d_vectors, (size_t)g_capacity * g_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_query,   g_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dists,   g_capacity * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_vectors, (size_t)g_capacity * g_dim * g_elem_size));
+    CUDA_CHECK(cudaMalloc(&d_query, g_dim * g_elem_size));
+    CUDA_CHECK(cudaMalloc(&d_dists, g_capacity * sizeof(float)));
 
-    h_dists = (float*)malloc(g_capacity * sizeof(float));
-    h_ids   = (int*)malloc(g_capacity * sizeof(int));
+    if (g_fmt == FMT_F16) {
+        d_staging_n = 1024 * g_dim;
+        CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
+    }
 
-    g_alive = (unsigned char*)malloc(g_capacity);
+    h_dists = (float *)malloc(g_capacity * sizeof(float));
+    h_ids = (int *)malloc(g_capacity * sizeof(int));
+    g_alive = (unsigned char *)malloc(g_capacity);
     memset(g_alive, 1, g_capacity);
     g_alive_cap = g_capacity;
-
     h_pinned_n = 1024 * g_dim;
     CUDA_CHECK(cudaMallocHost(&h_pinned, h_pinned_n * sizeof(float)));
 }
 
-static void gpu_ensure_pinned(int nfloats)
-{
+static void gpu_ensure_pinned(int nfloats) {
     if (nfloats <= h_pinned_n) return;
     CUDA_CHECK(cudaFreeHost(h_pinned));
     h_pinned_n = nfloats;
     CUDA_CHECK(cudaMallocHost(&h_pinned, h_pinned_n * sizeof(float)));
 }
 
-static void gpu_shutdown()
-{
+static void gpu_shutdown() {
     if (d_vectors) cudaFree(d_vectors);
-    if (d_query)   cudaFree(d_query);
-    if (d_dists)   cudaFree(d_dists);
-    if (h_pinned)  cudaFreeHost(h_pinned);
-    free(h_dists); free(h_ids); free(g_alive);
+    if (d_query) cudaFree(d_query);
+    if (d_dists) cudaFree(d_dists);
+    if (d_staging) cudaFree(d_staging);
+    if (h_pinned) cudaFreeHost(h_pinned);
+    free(h_dists);
+    free(h_ids);
+    free(g_alive);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Vector operations                                                  */
-/* ------------------------------------------------------------------ */
+/* upload fp32 host data, convert to fp16 on GPU if needed, store at dest */
+static void upload_and_store(const float *h_data, void *d_dest, int nfloats) {
+    if (g_fmt == FMT_F32) {
+        CUDA_CHECK(cudaMemcpy(d_dest, h_data, nfloats * sizeof(float), cudaMemcpyHostToDevice));
+    } else {
+        gpu_ensure_staging(nfloats);
+        CUDA_CHECK(cudaMemcpy(d_staging, h_data, nfloats * sizeof(float), cudaMemcpyHostToDevice));
+        launch_f32_to_f16(d_staging, d_dest, nfloats);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+}
 
-static int vec_push(const float* h_vec)
-{
+static int vec_push(const float *h_vec) {
     gpu_realloc_if_needed(g_count + 1);
     int slot = g_count;
-    CUDA_CHECK(cudaMemcpy(d_vectors + (size_t)slot * g_dim, h_vec,
-                          g_dim * sizeof(float), cudaMemcpyHostToDevice));
+    upload_and_store(h_vec, (char *)d_vectors + (size_t)slot * g_dim * g_elem_size, g_dim);
     g_count++;
     return slot;
 }
 
-static int vec_bpush(int n)
-{
+static int vec_bpush(int n) {
     gpu_realloc_if_needed(g_count + n);
     int first = g_count;
-    CUDA_CHECK(cudaMemcpy(d_vectors + (size_t)first * g_dim, h_pinned,
-                          (size_t)n * g_dim * sizeof(float),
-                          cudaMemcpyHostToDevice));
+    upload_and_store(h_pinned, (char *)d_vectors + (size_t)first * g_dim * g_elem_size, n * g_dim);
     g_count += n;
     return first;
 }
 
-/* mode: 0=L2, 1=cosine */
-static int vec_pull(const float* h_query, int* out_ids, float* out_dists, int mode)
-{
+static int vec_pull(const float *h_query, int *out_ids, float *out_dists, int mode) {
     int alive = g_count - g_deleted;
     if (alive <= 0) return 0;
     int n = g_count;
     int k = (alive < TOP_K) ? alive : TOP_K;
 
-    cudaGetLastError(); /* clear any stale errors */
+    cudaGetLastError();
+    upload_and_store(h_query, d_query, g_dim);
 
-    CUDA_CHECK(cudaMemcpy(d_query, h_query, g_dim * sizeof(float),
-                          cudaMemcpyHostToDevice));
-
-    if (mode == 1)
-        launch_cos_dist(d_vectors, d_query, d_dists, n, g_dim);
-    else
-        launch_l2_dist(d_vectors, d_query, d_dists, n, g_dim);
+    if (g_fmt == FMT_F32) {
+        if (mode == 1) launch_cos_f32((const float *)d_vectors, (const float *)d_query, d_dists, n, g_dim);
+        else launch_l2_f32((const float *)d_vectors, (const float *)d_query, d_dists, n, g_dim);
+    } else {
+        if (mode == 1) launch_cos_f16(d_vectors, d_query, d_dists, n, g_dim);
+        else launch_l2_f16(d_vectors, d_query, d_dists, n, g_dim);
+    }
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_dists, d_dists, n * sizeof(float),
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dists, d_dists, n * sizeof(float), cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < n; i++) {
         h_ids[i] = i;
@@ -268,108 +255,108 @@ static int vec_pull(const float* h_query, int* out_ids, float* out_dists, int mo
     }
 
     for (int i = 0; i < k; i++) {
-        out_ids[i]   = h_ids[i];
+        out_ids[i] = h_ids[i];
         out_dists[i] = h_dists[i];
     }
     return k;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Persistence                                                        */
-/* ------------------------------------------------------------------ */
+static void save_to_file() {
+    if (g_count == 0) return;
+    FILE *f = fopen(g_filepath, "wb");
+    if (!f) { fprintf(stderr, "ERROR: cannot open %s for writing\n", g_filepath); return; }
 
-static void save_to_file()
-{
-    if (g_count == 0) { printf("nothing to save\n"); return; }
-
-    char path[512];
-    snprintf(path, sizeof(path), "%s.tensors", g_name);
-
-    FILE* f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "ERROR: cannot open %s for writing\n", path); return; }
-
-    fwrite(&g_dim,     sizeof(int), 1, f);
-    fwrite(&g_count,   sizeof(int), 1, f);
+    fwrite(&g_dim, sizeof(int), 1, f);
+    fwrite(&g_count, sizeof(int), 1, f);
     fwrite(&g_deleted, sizeof(int), 1, f);
+    unsigned char fmt_byte = (unsigned char)g_fmt;
+    fwrite(&fmt_byte, 1, 1, f);
 
     if (g_count > 0) {
         fwrite(g_alive, 1, g_count, f);
-
-        size_t total = (size_t)g_count * g_dim;
-        gpu_ensure_pinned((int)total);
-        CUDA_CHECK(cudaMemcpy(h_pinned, d_vectors, total * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-        fwrite(h_pinned, sizeof(float), total, f);
+        size_t total_bytes = (size_t)g_count * g_dim * g_elem_size;
+        void *h_buf = malloc(total_bytes);
+        CUDA_CHECK(cudaMemcpy(h_buf, d_vectors, total_bytes, cudaMemcpyDeviceToHost));
+        fwrite(h_buf, 1, total_bytes, f);
+        free(h_buf);
     }
     fclose(f);
-    printf("saved %d vectors (%d deleted) to %s\n", g_count, g_deleted, path);
+    printf("saved %d vectors to %s\n", g_count, g_filepath);
 }
 
-static int load_from_file()
-{
-    char path[512];
-    snprintf(path, sizeof(path), "%s.tensors", g_name);
+/* peek header to set g_dim/g_fmt/g_elem_size before gpu_init */
+static int peek_file_header() {
+    FILE *f = fopen(g_filepath, "rb");
+    if (!f) return 0;
 
-    FILE* f = fopen(path, "rb");
+    int file_dim;
+    int dummy1, dummy2;
+    unsigned char file_fmt;
+    if (fread(&file_dim, sizeof(int), 1, f) != 1 ||
+        fread(&dummy1, sizeof(int), 1, f) != 1 ||
+        fread(&dummy2, sizeof(int), 1, f) != 1 ||
+        fread(&file_fmt, 1, 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    /* warn if args/filename disagree with header */
+    if (g_dim > 0 && file_dim != g_dim)
+        fprintf(stderr, "WARN: filename suggests dim=%d but header has dim=%d, using header\n", g_dim, file_dim);
+    if (file_fmt != g_fmt)
+        fprintf(stderr, "WARN: filename suggests %s but header has %s, using header\n", fmt_name(g_fmt), fmt_name(file_fmt));
+
+    g_dim = file_dim;
+    g_fmt = file_fmt;
+    g_elem_size = (g_fmt == FMT_F16) ? 2 : 4;
+    return 1;
+}
+
+static int load_from_file() {
+    FILE *f = fopen(g_filepath, "rb");
     if (!f) return 0;
 
     int file_dim, file_count, file_deleted;
+    unsigned char file_fmt;
     if (fread(&file_dim, sizeof(int), 1, f) != 1 ||
         fread(&file_count, sizeof(int), 1, f) != 1 ||
-        fread(&file_deleted, sizeof(int), 1, f) != 1) {
+        fread(&file_deleted, sizeof(int), 1, f) != 1 ||
+        fread(&file_fmt, 1, 1, f) != 1) {
         fclose(f);
-        fprintf(stderr, "WARN: corrupt %s, starting fresh\n", path);
+        fprintf(stderr, "WARN: corrupt %s, starting fresh\n", g_filepath);
         return 0;
-    }
-
-    if (file_dim != g_dim) {
-        fprintf(stderr, "ERROR: %s has dim=%d but requested dim=%d\n",
-                path, file_dim, g_dim);
-        fclose(f);
-        return -1;
     }
 
     if (file_count > 0) {
         gpu_realloc_if_needed(file_count);
-
         size_t mask_rd = fread(g_alive, 1, file_count, f);
         if ((int)mask_rd != file_count) {
             fprintf(stderr, "WARN: alive mask truncated\n");
             file_count = (int)mask_rd;
         }
-
-        size_t total = (size_t)file_count * g_dim;
-        gpu_ensure_pinned((int)total);
-
-        size_t rd = fread(h_pinned, sizeof(float), total, f);
-        if (rd != total) {
-            fprintf(stderr, "WARN: expected %llu floats, got %llu\n",
-                    (unsigned long long)total, (unsigned long long)rd);
-            file_count = (int)(rd / g_dim);
+        size_t total_bytes = (size_t)file_count * g_dim * g_elem_size;
+        void *h_buf = malloc(total_bytes);
+        size_t rd = fread(h_buf, 1, total_bytes, f);
+        if (rd != total_bytes) {
+            fprintf(stderr, "WARN: data truncated\n");
+            file_count = (int)(rd / (g_dim * g_elem_size));
         }
-
-        CUDA_CHECK(cudaMemcpy(d_vectors, h_pinned,
-                              (size_t)file_count * g_dim * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        g_count   = file_count;
+        CUDA_CHECK(cudaMemcpy(d_vectors, h_buf, (size_t)file_count * g_dim * g_elem_size, cudaMemcpyHostToDevice));
+        free(h_buf);
+        g_count = file_count;
         g_deleted = file_deleted;
     }
 
     fclose(f);
-    printf("loaded %d vectors (%d deleted) from %s\n", g_count, g_deleted, path);
     return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Protocol parser                                                    */
-/* ------------------------------------------------------------------ */
-
-static int parse_floats(const char* s, float* out, int max_n)
-{
+static int parse_floats(const char *s, float *out, int max_n) {
     int n = 0;
-    const char* p = s;
+    const char *p = s;
     while (*p && n < max_n) {
-        char* end;
+        char *end;
         float v = strtof(p, &end);
         if (end == p) break;
         out[n++] = v;
@@ -379,25 +366,20 @@ static int parse_floats(const char* s, float* out, int max_n)
     return n;
 }
 
-typedef int (*write_fn)(void* ctx, const char* buf, int len);
+typedef int (*write_fn)(void *ctx, const char *buf, int len);
 
-static int process_command(const char* line, int line_len,
-                           write_fn writer, void* wctx,
-                           const char* bin_payload, int bin_payload_len)
-{
+static int process_command(const char *line, int line_len, write_fn writer, void *wctx, const char *bin_payload, int bin_payload_len) {
     char resp[4096];
     int rlen;
 
-    while (line_len > 0 && (line[line_len-1] == '\n' || line[line_len-1] == '\r'))
-        line_len--;
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) line_len--;
     if (line_len == 0) return 0;
 
     if (line_len > 5 && strncmp(line, "push ", 5) == 0) {
-        float* vals = (float*)malloc(g_dim * sizeof(float));
+        float *vals = (float *)malloc(g_dim * sizeof(float));
         int n = parse_floats(line + 5, vals, g_dim);
         if (n != g_dim) {
-            rlen = snprintf(resp, sizeof(resp),
-                            "err dim mismatch: got %d, expected %d\n", n, g_dim);
+            rlen = snprintf(resp, sizeof(resp), "err dim mismatch: got %d, expected %d\n", n, g_dim);
             writer(wctx, resp, rlen);
             free(vals);
             return 0;
@@ -418,8 +400,7 @@ static int process_command(const char* line, int line_len,
         }
         int expected_bytes = n * g_dim * (int)sizeof(float);
         if (bin_payload_len < expected_bytes) {
-            rlen = snprintf(resp, sizeof(resp), "err need %d bytes, got %d\n",
-                            expected_bytes, bin_payload_len);
+            rlen = snprintf(resp, sizeof(resp), "err need %d bytes, got %d\n", expected_bytes, bin_payload_len);
             writer(wctx, resp, rlen);
             return 0;
         }
@@ -431,20 +412,15 @@ static int process_command(const char* line, int line_len,
         return 0;
     }
 
-    /* pull (L2) or cpull (cosine) */
     int pull_mode = -1;
     int pull_offset = 0;
-    if (line_len > 5 && strncmp(line, "pull ", 5) == 0) {
-        pull_mode = 0; pull_offset = 5;
-    } else if (line_len > 6 && strncmp(line, "cpull ", 6) == 0) {
-        pull_mode = 1; pull_offset = 6;
-    }
+    if (line_len > 5 && strncmp(line, "pull ", 5) == 0) { pull_mode = 0; pull_offset = 5; }
+    else if (line_len > 6 && strncmp(line, "cpull ", 6) == 0) { pull_mode = 1; pull_offset = 6; }
     if (pull_mode >= 0) {
-        float* vals = (float*)malloc(g_dim * sizeof(float));
+        float *vals = (float *)malloc(g_dim * sizeof(float));
         int n = parse_floats(line + pull_offset, vals, g_dim);
         if (n != g_dim) {
-            rlen = snprintf(resp, sizeof(resp),
-                            "err dim mismatch: got %d, expected %d\n", n, g_dim);
+            rlen = snprintf(resp, sizeof(resp), "err dim mismatch: got %d, expected %d\n", n, g_dim);
             writer(wctx, resp, rlen);
             free(vals);
             return 0;
@@ -453,14 +429,13 @@ static int process_command(const char* line, int line_len,
         float dists[TOP_K];
         int k = vec_pull(vals, ids, dists, pull_mode);
         free(vals);
-
-        char* p = resp;
+        char *p = resp;
         int rem = sizeof(resp);
         for (int i = 0; i < k; i++) {
             int w = snprintf(p, rem, "%s%d:%.6f", i > 0 ? "," : "", ids[i], dists[i]);
             p += w; rem -= w;
         }
-        *p++ = '\n'; rem--;
+        *p++ = '\n';
         writer(wctx, resp, (int)(p - resp));
         return 0;
     }
@@ -516,22 +491,15 @@ static int process_command(const char* line, int line_len,
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  I/O: TCP                                                           */
-/* ------------------------------------------------------------------ */
-
-static int tcp_writer(void* ctx, const char* buf, int len)
-{
-    SOCKET s = *(SOCKET*)ctx;
+static int tcp_writer(void *ctx, const char *buf, int len) {
+    SOCKET s = *(SOCKET *)ctx;
     return send(s, buf, len, 0);
 }
 
-static DWORD WINAPI tcp_client_thread(LPVOID param)
-{
-    SOCKET client = *(SOCKET*)param;
+static DWORD WINAPI tcp_client_thread(LPVOID param) {
+    SOCKET client = *(SOCKET *)param;
     free(param);
-
-    char* buf = (char*)malloc(MAX_LINE);
+    char *buf = (char *)malloc(MAX_LINE);
     int buf_used = 0;
 
     while (g_running) {
@@ -541,9 +509,8 @@ static DWORD WINAPI tcp_client_thread(LPVOID param)
         buf[buf_used] = '\0';
 
         while (1) {
-            char* nl = (char*)memchr(buf, '\n', buf_used);
+            char *nl = (char *)memchr(buf, '\n', buf_used);
             if (!nl) break;
-
             int line_len = (int)(nl - buf);
 
             if (line_len > 6 && strncmp(buf, "bpush ", 6) == 0) {
@@ -551,22 +518,18 @@ static DWORD WINAPI tcp_client_thread(LPVOID param)
                 int payload_bytes = n * g_dim * (int)sizeof(float);
                 int header_bytes = line_len + 1;
                 int total_needed = header_bytes + payload_bytes;
-
                 while (buf_used < total_needed && g_running) {
                     r = recv(client, buf + buf_used, MAX_LINE - buf_used, 0);
                     if (r <= 0) goto done;
                     buf_used += r;
                 }
-
-                int rc = process_command(buf, line_len, tcp_writer, &client,
-                                         buf + header_bytes, payload_bytes);
+                int rc = process_command(buf, line_len, tcp_writer, &client, buf + header_bytes, payload_bytes);
                 int consumed = total_needed;
                 buf_used -= consumed;
                 if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
                 if (rc == 1) goto done;
             } else {
-                int rc = process_command(buf, line_len, tcp_writer, &client,
-                                         NULL, 0);
+                int rc = process_command(buf, line_len, tcp_writer, &client, NULL, 0);
                 int consumed = line_len + 1;
                 buf_used -= consumed;
                 if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
@@ -581,8 +544,7 @@ done:
     return 0;
 }
 
-static DWORD WINAPI tcp_listener_thread(LPVOID param)
-{
+static DWORD WINAPI tcp_listener_thread(LPVOID param) {
     (void)param;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -595,21 +557,18 @@ static DWORD WINAPI tcp_listener_thread(LPVOID param)
     }
 
     int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
+    addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons((unsigned short)g_port);
+    addr.sin_port = htons((unsigned short)g_port);
 
-    if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        if (err == WSAEADDRINUSE) {
-            fprintf(stderr, "ERROR: port %d is already in use\n", g_port);
-        } else {
-            fprintf(stderr, "ERROR: bind() failed: %d\n", err);
-        }
+        if (err == WSAEADDRINUSE) fprintf(stderr, "ERROR: port %d is already in use\n", g_port);
+        else fprintf(stderr, "ERROR: bind() failed: %d\n", err);
         closesocket(listen_sock);
         g_running = 0;
         return 1;
@@ -627,11 +586,9 @@ static DWORD WINAPI tcp_listener_thread(LPVOID param)
         tv.tv_usec = 0;
         int sel = select(0, &fds, NULL, NULL, &tv);
         if (sel <= 0) continue;
-
         SOCKET client = accept(listen_sock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
-
-        SOCKET* ps = (SOCKET*)malloc(sizeof(SOCKET));
+        SOCKET *ps = (SOCKET *)malloc(sizeof(SOCKET));
         *ps = client;
         CreateThread(NULL, 0, tcp_client_thread, ps, 0, NULL);
     }
@@ -641,36 +598,24 @@ static DWORD WINAPI tcp_listener_thread(LPVOID param)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  I/O: Named pipe                                                    */
-/* ------------------------------------------------------------------ */
-
-static int pipe_writer(void* ctx, const char* buf, int len)
-{
-    HANDLE pipe = *(HANDLE*)ctx;
+static int pipe_writer(void *ctx, const char *buf, int len) {
+    HANDLE pipe = *(HANDLE *)ctx;
     DWORD written;
     WriteFile(pipe, buf, len, &written, NULL);
     FlushFileBuffers(pipe);
     return (int)written;
 }
 
-static DWORD WINAPI pipe_listener_thread(LPVOID param)
-{
+static DWORD WINAPI pipe_listener_thread(LPVOID param) {
     (void)param;
     char pipe_name[512];
     snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\vec_%s", g_name);
-
     printf("Pipe listening on %s\n", pipe_name);
 
     while (g_running) {
-        HANDLE pipe = CreateNamedPipeA(
-            pipe_name,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            PIPE_BUF_SIZE, PIPE_BUF_SIZE,
-            1000,
-            NULL);
+        HANDLE pipe = CreateNamedPipeA(pipe_name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUF_SIZE, PIPE_BUF_SIZE, 1000, NULL);
 
         if (pipe == INVALID_HANDLE_VALUE) {
             fprintf(stderr, "ERROR: CreateNamedPipe failed: %lu\n", GetLastError());
@@ -697,19 +642,18 @@ static DWORD WINAPI pipe_listener_thread(LPVOID param)
             continue;
         }
 
-        char* buf = (char*)malloc(MAX_LINE);
+        char *buf = (char *)malloc(MAX_LINE);
         int buf_used = 0;
 
         while (g_running) {
             DWORD bytesRead;
-            BOOL ok = ReadFile(pipe, buf + buf_used, MAX_LINE - buf_used - 1,
-                               &bytesRead, NULL);
+            BOOL ok = ReadFile(pipe, buf + buf_used, MAX_LINE - buf_used - 1, &bytesRead, NULL);
             if (!ok || bytesRead == 0) break;
             buf_used += (int)bytesRead;
             buf[buf_used] = '\0';
 
             while (1) {
-                char* nl = (char*)memchr(buf, '\n', buf_used);
+                char *nl = (char *)memchr(buf, '\n', buf_used);
                 if (!nl) break;
                 int line_len = (int)(nl - buf);
 
@@ -718,84 +662,214 @@ static DWORD WINAPI pipe_listener_thread(LPVOID param)
                     int payload_bytes = n * g_dim * (int)sizeof(float);
                     int header_bytes = line_len + 1;
                     int total_needed = header_bytes + payload_bytes;
-
                     while (buf_used < total_needed && g_running) {
-                        ok = ReadFile(pipe, buf + buf_used,
-                                      MAX_LINE - buf_used, &bytesRead, NULL);
-                        if (!ok || bytesRead == 0) goto pipe_client_done;
+                        ok = ReadFile(pipe, buf + buf_used, MAX_LINE - buf_used, &bytesRead, NULL);
+                        if (!ok || bytesRead == 0) goto pipe_done;
                         buf_used += (int)bytesRead;
                     }
-
-                    int rc = process_command(buf, line_len, pipe_writer, &pipe,
-                                             buf + header_bytes, payload_bytes);
+                    int rc = process_command(buf, line_len, pipe_writer, &pipe, buf + header_bytes, payload_bytes);
                     int consumed = total_needed;
                     buf_used -= consumed;
                     if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                    if (rc == 1) goto pipe_client_done;
+                    if (rc == 1) goto pipe_done;
                 } else {
-                    int rc = process_command(buf, line_len, pipe_writer, &pipe,
-                                             NULL, 0);
+                    int rc = process_command(buf, line_len, pipe_writer, &pipe, NULL, 0);
                     int consumed = line_len + 1;
                     buf_used -= consumed;
                     if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                    if (rc == 1) goto pipe_client_done;
+                    if (rc == 1) goto pipe_done;
                 }
             }
         }
 
-pipe_client_done:
+    pipe_done:
         free(buf);
         FlushFileBuffers(pipe);
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
-
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Signal handling                                                    */
-/* ------------------------------------------------------------------ */
-
-static BOOL WINAPI ctrl_handler(DWORD type)
-{
+static BOOL WINAPI ctrl_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        if (!g_running) return TRUE;
+        g_running = 0;
         printf("\nshutting down...\n");
         save_to_file();
-        g_running = 0;
         return TRUE;
     }
     return FALSE;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Main                                                               */
-/* ------------------------------------------------------------------ */
-
-static void generate_random_name(char* buf, int len)
-{
+static void generate_random_name(char *buf, int len) {
     const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
     srand((unsigned)GetTickCount());
-    for (int i = 0; i < len; i++)
-        buf[i] = chars[rand() % (sizeof(chars) - 1)];
+    for (int i = 0; i < len; i++) buf[i] = chars[rand() % (sizeof(chars) - 1)];
     buf[len] = '\0';
 }
 
-int main(int argc, char** argv)
-{
+static void set_format(const char *s) {
+    if (strcmp(s, "f16") == 0 || strcmp(s, "fp16") == 0 || strcmp(s, "16") == 0) { g_fmt = FMT_F16; g_elem_size = 2; }
+    else if (strcmp(s, "f32") == 0 || strcmp(s, "fp32") == 0 || strcmp(s, "32") == 0) { g_fmt = FMT_F32; g_elem_size = 4; }
+    else { fprintf(stderr, "ERROR: unknown format '%s' (use f16 or f32)\n", s); exit(1); }
+}
+
+static void parse_dim_format(const char *arg) {
+    char buf[256];
+    strncpy(buf, arg, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *colon = strchr(buf, ':');
+    if (colon) {
+        *colon = '\0';
+        set_format(colon + 1);
+    }
+    g_dim = atoi(buf);
+}
+
+/* parse filename like test_1024_f16.tensors into g_name, g_dim, g_fmt */
+static int parse_tensors_filename(const char *filename) {
+    /* extract basename from path */
+    const char *base = filename;
+    const char *p = filename;
+    while (*p) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+        p++;
+    }
+    char buf[256];
+    strncpy(buf, base, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    /* strip .tensors */
+    char *ext = strstr(buf, ".tensors");
+    if (!ext) return 0;
+    *ext = '\0';
+
+    /* parse: name_dim_fmt */
+    char *last_sep = strrchr(buf, '_');
+    if (!last_sep) return 0;
+    *last_sep = '\0';
+    const char *fmt_str = last_sep + 1;
+
+    char *dim_sep = strrchr(buf, '_');
+    if (!dim_sep) return 0;
+    *dim_sep = '\0';
+    const char *dim_str = dim_sep + 1;
+
+    strncpy(g_name, buf, sizeof(g_name) - 1);
+    g_dim = atoi(dim_str);
+    set_format(fmt_str);
+
+    return (g_dim > 0);
+}
+
+static void build_filepath() {
+    snprintf(g_filepath, sizeof(g_filepath), "%s_%d_%s.tensors", g_name, g_dim, fmt_name(g_fmt));
+}
+
+/* scan for existing test_*.tensors, prioritize 1024 f32 */
+static int find_existing_db(const char *name) {
+    WIN32_FIND_DATAA fd;
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s_*.tensors", name);
+
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    char best[512] = {0};
+    int best_score = -1;
+
+    do {
+        char tmp_name[256];
+        int tmp_dim, tmp_fmt_val;
+        /* quick parse: name_dim_fmt.tensors */
+        char buf[256];
+        strncpy(buf, fd.cFileName, sizeof(buf) - 1);
+        char *ext = strstr(buf, ".tensors");
+        if (!ext) continue;
+        *ext = '\0';
+
+        char *ls = strrchr(buf, '_');
+        if (!ls) continue;
+        *ls = '\0';
+        const char *fs = ls + 1;
+
+        char *ds = strrchr(buf, '_');
+        if (!ds) continue;
+        *ds = '\0';
+
+        int d = atoi(ds + 1);
+        if (d <= 0) continue;
+
+        int fv = (strcmp(fs, "f16") == 0) ? FMT_F16 : FMT_F32;
+
+        /* score: f32 > f16, 1024 > others */
+        int score = 0;
+        if (fv == FMT_F32) score += 100;
+        if (d == 1024) score += 50;
+
+        if (score > best_score) {
+            best_score = score;
+            strncpy(best, fd.cFileName, sizeof(best) - 1);
+            strncpy(g_name, buf, sizeof(g_name) - 1);
+            g_dim = d;
+            if (fv == FMT_F16) { g_fmt = FMT_F16; g_elem_size = 2; }
+            else { g_fmt = FMT_F32; g_elem_size = 4; }
+        }
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+    if (best_score >= 0) {
+        build_filepath();
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int port_arg_idx = -1;
+
     if (argc < 2) {
+        /* double-click: random name, defaults */
         generate_random_name(g_name, 6);
         g_dim = 1024;
-    } else if (argc < 3) {
-        strncpy(g_name, argv[1], sizeof(g_name) - 1);
-        g_dim = 1024;
+        build_filepath();
     } else {
-        strncpy(g_name, argv[1], sizeof(g_name) - 1);
-        g_dim = atoi(argv[2]);
+        const char *arg1 = argv[1];
+
+        /* check if arg1 is a .tensors filepath - load strictly from header */
+        if (strstr(arg1, ".tensors")) {
+            strncpy(g_filepath, arg1, sizeof(g_filepath) - 1);
+            /* extract name from path for mutex/pipe */
+            const char *base = arg1;
+            for (const char *p = arg1; *p; p++)
+                if (*p == '\\' || *p == '/') base = p + 1;
+            char tmp[256];
+            strncpy(tmp, base, sizeof(tmp) - 1);
+            char *dot = strstr(tmp, ".tensors");
+            if (dot) *dot = '\0';
+            strncpy(g_name, tmp, sizeof(g_name) - 1);
+            port_arg_idx = 2;
+        } else if (argc >= 3) {
+            /* vec name dim[:fmt] [port] */
+            strncpy(g_name, arg1, sizeof(g_name) - 1);
+            parse_dim_format(argv[2]);
+            build_filepath();
+            port_arg_idx = 3;
+        } else {
+            /* vec name - try to find existing db */
+            strncpy(g_name, arg1, sizeof(g_name) - 1);
+            if (!find_existing_db(arg1)) {
+                /* no existing file, use defaults */
+                g_dim = 1024;
+                build_filepath();
+            }
+            port_arg_idx = 2;
+        }
     }
 
-    if (argc >= 4) {
-        g_port = atoi(argv[3]);
+    if (port_arg_idx > 0 && port_arg_idx < argc) {
+        g_port = atoi(argv[port_arg_idx]);
         if (g_port <= 0 || g_port > 65535) {
             fprintf(stderr, "ERROR: port must be between 1 and 65535\n");
             return 1;
@@ -807,21 +881,26 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (!acquire_instance_lock()) {
-        return 1;
-    }
+    if (!acquire_instance_lock()) return 1;
 
-    printf("name=%s dim=%d port=%d storage=fp32\n", g_name, g_dim, g_port);
+    int file_exists = peek_file_header();
 
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
-    printf("GPU: %s (%.0f MB)\n", prop.name,
-           prop.totalGlobalMem / (1024.0 * 1024.0));
+    double vram_gb = prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0);
+    double max_records = (prop.totalGlobalMem * 0.9) / ((double)g_dim * g_elem_size);
+
+    printf("%s (%.1f GB)\n", prop.name, vram_gb);
 
     gpu_init();
-    cudaGetLastError(); /* clear any init-time errors */
+    cudaGetLastError();
+
+    /* warm up GPU - first kernel launch has ~1s overhead */
+    launch_l2_f32((const float *)d_vectors, (const float *)d_query, d_dists, 1, g_dim);
+    cudaDeviceSynchronize();
+    cudaGetLastError();
 
     int lr = load_from_file();
     if (lr < 0) {
@@ -830,9 +909,23 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (file_exists && lr > 0) {
+        double used = g_count / 1000000.0;
+        double avail = ((max_records - g_count) / max_records) * 100.0;
+        if (avail < 0) avail = 0;
+        printf("loading %.1fm records from %s\n", used, g_filepath);
+        printf("remaining space: %.1f%%\n", avail);
+    } else {
+        printf("initializing database %s\n", g_filepath);
+        if (max_records >= 1000000.0)
+            printf("approx capacity: %.1fm records\n", max_records / 1000000.0);
+        else
+            printf("approx capacity: %.0f records\n", max_records);
+    }
+
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
-    HANDLE h_tcp  = CreateThread(NULL, 0, tcp_listener_thread, NULL, 0, NULL);
+    HANDLE h_tcp = CreateThread(NULL, 0, tcp_listener_thread, NULL, 0, NULL);
     HANDLE h_pipe = CreateThread(NULL, 0, pipe_listener_thread, NULL, 0, NULL);
 
     Sleep(200);
@@ -842,20 +935,14 @@ int main(int argc, char** argv)
         release_instance_lock();
         return 1;
     }
+    printf("ready for connections, ctrl+c to exit\n");
 
-    int alive = g_count - g_deleted;
-    printf("ready. %d vectors loaded (%d active). Ctrl+C to save & exit.\n",
-           g_count, alive);
+    while (g_running) { Sleep(500); }
 
-    while (g_running) {
-        Sleep(500);
-    }
-
-    WaitForSingleObject(h_tcp,  3000);
+    WaitForSingleObject(h_tcp, 3000);
     WaitForSingleObject(h_pipe, 3000);
 
     gpu_shutdown();
     release_instance_lock();
-    printf("done.\n");
     return 0;
 }

@@ -73,15 +73,19 @@ Bottleneck is pure memory bandwidth.
 ### Usage
 
 ```cmd
-vec <name> <dim> [port]
+vec <name> [dim[:format]] [port]
+vec <path/to/file.tensors> [port]
 ```
 
 ```cmd
-vec                        :: uses default values (1024 dimensions, port 1920)
-vec mydb 1024              :: default port 1920
+vec                        :: random name, 1024 dim, fp32, port 1920
+vec mydb                   :: auto-detect from existing .tensors file or create 1024/fp32
+vec mydb 1024              :: fp32 (default)
+vec mydb 1024:f16          :: fp16 storage, 2x capacity
 vec mydb 1024 1921         :: custom port
-vec embeddings 768 1920    :: different db, different dimensions
-vec faces 512 1921         :: run multiple instances
+vec mydb 1024:f16 1921     :: fp16 + custom port
+vec mydb.tensors           :: load directly from file, read params from header
+vec "d:\data\mydb_1024_f16.tensors"  :: load from full path
 ```
 
 Each instance gets its own TCP port, named pipe (`\\.\pipe\vec_<name>`), and save file (`<name>.tensors`). Duplicate names are blocked automatically.
@@ -207,7 +211,65 @@ vec mydb 1024
 test mydb 1024
 ```
 
-Pushes 50 random vectors, queries a noisy copy with both L2 and cosine distance, verifies the original comes back as rank 1.
+Pushes 1000 random vectors, queries a noisy copy with both L2 and cosine distance, verifies the original comes back as rank 1.
+
+---
+
+## BOX - companion string store
+
+**box** is a memory-resident key-value string store that shares the same index space with vec. Push a vector to vec, push metadata to box - both return the same index. Query vec for similar vectors, use the indices to look up metadata in box.
+
+```cmd
+:: Terminal 1 - vector store
+vec mydb 1024
+
+:: Terminal 2 - metadata store
+box mydb 255 2020
+```
+
+### Typical workflow
+
+```
+vec:  push 0.12,0.45,...   -> 42
+box:  push {"name":"cat","file":"img_042.jpg"}   -> 42
+
+vec:  pull 0.11,0.44,...   -> 42:0.0012,17:0.0891,...
+box:  pull 42              -> {"name":"cat","file":"img_042.jpg"}
+box:  pull 17              -> {"name":"dog","file":"img_017.jpg"}
+```
+
+### Protocol
+
+Same style as vec. TCP port 2020 (default) and named pipe `\\.\pipe\box_<name>`.
+
+| Command | Example | Response |
+|---|---|---|
+| **push** | `push hello world\n` | `0\n` |
+| **pull** | `pull 0\n` | `hello world\n` |
+| **delete** | `delete 0\n` | `ok\n` |
+| **undo** | `undo\n` | `ok\n` |
+| **save** | `save\n` | `ok\n` |
+| **size** | `size\n` | `50\n` |
+
+### Usage
+
+```cmd
+box <name> [slot_size] [port]
+```
+
+```cmd
+box mydb              :: 255 byte slots, port 2020
+box mydb 512          :: 512 byte slots
+box mydb 255 2021     :: custom port
+```
+
+Stores UTF-8 strings. Persists to `<name>.mem` file. No GPU required.
+
+### Build
+
+```cmd
+cl /O2 /EHsc box.cpp /Fe:box.exe ws2_32.lib
+```
 
 ---
 

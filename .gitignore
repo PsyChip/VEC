@@ -1,6 +1,0 @@
-*.obj
-*.lib
-*.exp
-*.exe
-*.tensors
-*.mem
