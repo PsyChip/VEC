@@ -55,7 +55,7 @@
 #define DEFAULT_PORT 1920
 #define TOP_K 10
 #define INITIAL_CAP 4096
-#define MAX_LINE (1 << 20)
+#define MAX_LINE (1 << 24)
 #define SOCK_BUF_SIZE (1 << 16)
 
 #define FMT_F32 0
@@ -821,15 +821,21 @@ int main(int argc, char **argv) {
     }
 
     if (file_exists && lr > 0) {
-        double used = g_count / 1000000.0;
-        double avail = ((max_records - g_count) / max_records) * 100.0;
-        if (avail < 0) avail = 0;
-        printf("loading %.1fm records from %s\n", used, g_filepath);
-        printf("remaining space: %.1f%%\n", avail);
+        double remaining = max_records - g_count;
+        double avail = (remaining / max_records) * 100.0;
+        if (avail < 0) { avail = 0; remaining = 0; }
+        if (g_count >= 1000000) printf("loading %.1fm records from %s\n", g_count / 1000000.0, g_filepath);
+        else if (g_count >= 1000) printf("loading %.1fk records from %s\n", g_count / 1000.0, g_filepath);
+        else printf("loading %d records from %s\n", g_count, g_filepath);
+        if (remaining >= 1000000.0) printf("remaining space: %.1fm records (%.1f%%)\n", remaining / 1000000.0, avail);
+        else if (remaining >= 1000.0) printf("remaining space: %.1fk records (%.1f%%)\n", remaining / 1000.0, avail);
+        else printf("remaining space: %.0f records (%.1f%%)\n", remaining, avail);
     } else {
         printf("initializing database %s\n", g_filepath);
         if (max_records >= 1000000.0)
             printf("approx capacity: %.1fm records\n", max_records / 1000000.0);
+        else if (max_records >= 1000.0)
+            printf("approx capacity: %.1fk records\n", max_records / 1000.0);
         else
             printf("approx capacity: %.0f records\n", max_records);
     }

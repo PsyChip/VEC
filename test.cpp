@@ -85,21 +85,29 @@ static void print_results(const char *resp, int pick) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: test <name> <dim> [port]\n");
+        fprintf(stderr, "Usage: test <name> <dim> [host:port]\n");
         return 1;
     }
 
     const char *name = argv[1];
     int dim = atoi(argv[2]);
+    char host[256] = "127.0.0.1";
     int port = DEFAULT_PORT;
-    if (argc >= 4) port = atoi(argv[3]);
+    if (argc >= 4) {
+        strncpy(host, argv[3], sizeof(host) - 1);
+        char *colon = strchr(host, ':');
+        if (colon) {
+            *colon = '\0';
+            port = atoi(colon + 1);
+        }
+    }
 
     if (dim <= 0) {
         fprintf(stderr, "ERROR: invalid dim\n");
         return 1;
     }
 
-    printf("name=%s dim=%d port=%d vectors=%d\n", name, dim, port, NUM_VECTORS);
+    printf("name=%s dim=%d host=%s port=%d vectors=%d\n", name, dim, host, port, NUM_VECTORS);
     srand((unsigned)time(NULL));
 
     size_t total_floats = (size_t)NUM_VECTORS * dim;
@@ -126,37 +134,53 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        struct hostent *he = gethostbyname(host);
+        if (!he) {
+            fprintf(stderr, "ERROR: cannot resolve '%s'\n", host);
+            closesocket(s);
+            WSACleanup();
+            return 1;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
     addr.sin_port = htons((unsigned short)port);
 
     if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        fprintf(stderr, "ERROR: connect() failed - is vec running on port %d?\n", port);
+        fprintf(stderr, "ERROR: connect() failed - is vec running on %s:%d?\n", host, port);
         closesocket(s);
         WSACleanup();
         return 1;
     }
-    printf("connected to 127.0.0.1:%d\n", port);
+    printf("connected to %s:%d\n", host, port);
 
     char *cmd = (char *)malloc(BUF_SIZE);
     char resp[4096];
 
-    printf("pushing %d vectors...\n", NUM_VECTORS);
+    printf("pushing %d vectors via bpush...\n", NUM_VECTORS);
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
-    for (int i = 0; i < NUM_VECTORS; i++) {
-        char *p = cmd;
-        p += sprintf(p, "push ");
-        for (int d = 0; d < dim; d++) {
-            if (d > 0) *p++ = ',';
-            p += sprintf(p, "%.6f", vectors[i * dim + d]);
+    {
+        /* send: bpush <count>\n<raw fp32 bytes> */
+        char header[64];
+        int hlen = sprintf(header, "bpush %d\n", NUM_VECTORS);
+        send(s, header, hlen, 0);
+
+        int payload_bytes = NUM_VECTORS * dim * (int)sizeof(float);
+        int sent = 0;
+        while (sent < payload_bytes) {
+            int chunk = payload_bytes - sent;
+            if (chunk > 65536) chunk = 65536;
+            int r = send(s, (const char *)vectors + sent, chunk, 0);
+            if (r <= 0) { fprintf(stderr, "ERROR: send failed\n"); goto done; }
+            sent += r;
         }
-        *p++ = '\n';
-        *p = '\0';
-        sock_command(s, cmd, resp, sizeof(resp));
+
+        sock_readline(s, resp, sizeof(resp));
         if (strncmp(resp, "err", 3) == 0) {
-            fprintf(stderr, "ERROR on push %d: %s", i, resp);
+            fprintf(stderr, "ERROR on bpush: %s", resp);
             goto done;
         }
     }
