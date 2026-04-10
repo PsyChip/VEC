@@ -572,7 +572,7 @@ static void *tcp_listener_thread(void *param) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((unsigned short)g_port);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -584,7 +584,7 @@ static void *tcp_listener_thread(void *param) {
     }
 
     listen(listen_fd, SOMAXCONN);
-    printf("TCP listening on 127.0.0.1:%d\n", g_port);
+    printf("TCP listening on 0.0.0.0:%d\n", g_port);
 
     while (g_running) {
         fd_set fds;
