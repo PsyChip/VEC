@@ -16,61 +16,77 @@ VEC uses a text-based TCP protocol. One command per line (`\n` terminated), one 
 
 | Command | Format | Response |
 |---------|--------|----------|
-| push | `push <comma-separated floats>\n` | `<slot_index>\n` |
-| pull | `pull <comma-separated floats>\n` | `<id:dist,id:dist,...>\n` |
-| cpull | `cpull <comma-separated floats>\n` | `<id:dist,id:dist,...>\n` |
-| bpush | `bpush <count>\n<raw bytes>` | `<first_slot_index>\n` |
-| delete | `delete <slot_index>\n` | `ok\n` |
+| push | `push [label] <floats>\n` | `<slot_index>\n` |
+| bpush | `bpush [label]\n<raw bytes>` | `<slot_index>\n` |
+| pull | `pull <floats>\n` | `<results>\n` |
+| cpull | `cpull <floats>\n` | `<results>\n` |
+| bpull | `bpull\n<raw bytes>` | `<results>\n` |
+| bcpull | `bcpull\n<raw bytes>` | `<results>\n` |
+| label | `label <index> <string>\n` | `ok\n` |
+| delete | `delete <index>\n` | `ok\n` |
 | undo | `undo\n` | `ok\n` |
 | save | `save\n` | `ok\n` |
 | size | `size\n` | `<count>\n` |
 
 ### push
 
-Send a vector as comma-separated fp32 floats. Dimension must match server configuration.
+Send a vector as comma-separated fp32 floats with optional label. Dimension must match server.
 
 ```
 -> push 0.123,0.456,0.789\n
 <- 42\n
+
+-> push docs/report.pdf?page=2 0.123,0.456,0.789\n
+<- 43\n
 ```
 
-Returns the slot index. Store this - it's your key.
+### bpush (binary push)
 
-### pull (L2 distance)
+Send a single vector as raw fp32 binary data with optional label. Faster than text push.
 
-Query nearest neighbors by Euclidean distance.
+```
+-> bpush\n
+-> <dim * 4 bytes of raw little-endian fp32 data>
+<- 42\n
+
+-> bpush docs/report.pdf?page=2\n
+-> <dim * 4 bytes of raw little-endian fp32 data>
+<- 43\n
+```
+
+### pull / cpull (text query)
+
+Query nearest neighbors. `pull` uses L2 distance, `cpull` uses cosine distance.
 
 ```
 -> pull 0.123,0.456,0.789\n
-<- 0:0.001234,5:0.045100,12:0.234000\n
+<- docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100,12:0.234000\n
 ```
 
-Returns up to 10 results as `index:distance` pairs, comma-separated, sorted nearest first.
+Results are `label:distance` or `index:distance` pairs, comma-separated, nearest first. Up to 10 results. Labels must not contain colons or commas.
 
-### cpull (cosine distance)
+### bpull / bcpull (binary query)
 
-Query nearest neighbors by cosine distance.
-
-```
--> cpull 0.123,0.456,0.789\n
-<- 0:0.001234,5:0.045100,12:0.234000\n
-```
-
-Same format as pull. Use for text embeddings. Use pull for vision embeddings.
-
-### bpush (binary bulk push)
-
-Send multiple vectors as raw fp32 binary data. Much faster than individual text pushes.
+Same as pull/cpull but query vector is sent as raw fp32 bytes instead of text.
 
 ```
--> bpush <count>\n
--> <count * dim * 4 bytes of raw little-endian fp32 data>
-<- <first_slot_index>\n
+-> bpull\n
+-> <dim * 4 bytes of raw little-endian fp32 data>
+<- docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100\n
 ```
 
-The server knows the dimension from startup. Expected bytes = `count * dim * sizeof(float)`.
+`bcpull` uses cosine distance.
 
-Vectors are laid out contiguously: `[vec0_f0, vec0_f1, ..., vec0_fN, vec1_f0, vec1_f1, ...]`
+### label
+
+Set or override a label for an existing slot.
+
+```
+-> label 42 docs/report.pdf?page=2\n
+<- ok\n
+```
+
+Labels must not contain colons or commas (they will be stripped with a warning).
 
 ### Errors
 
@@ -84,7 +100,9 @@ err empty
 err unknown command
 ```
 
-## .tensors File Format
+## File Format
+
+### .tensors (vector data)
 
 Binary file, little-endian:
 
@@ -96,24 +114,39 @@ Offset  Size              Description
 12      1 byte (uint8)    format (0=fp32, 1=fp16)
 13      count bytes       alive mask (1=active, 0=deleted)
 13+N    count*dim*elem    vector data (elem=4 for fp32, 2 for fp16)
+EOF-4   4 bytes (uint32)  CRC32 checksum
 ```
 
-File naming convention: `<name>_<dim>_<format>.tensors`
-Example: `mydb_1024_f32.tensors`
+### .meta (label data)
+
+Companion file, created only when labels exist:
+
+```
+Offset  Size              Description
+0       4 bytes (int32)   label count
+        per label:
+          4 bytes (int32) string length (0 = no label)
+          N bytes         string data (if length > 0)
+```
+
+File naming: `<name>_<dim>_<format>.tensors` + `<name>_<dim>_<format>.meta`
 
 ## Client Libraries
 
 - `vec_client.py` - Python
 - `vec_client.js` - Node.js
-- `vec_client.cpp` / `vec_client.h` - C++
+- `vec_client.h` - C++
 - `vec_client.pas` - Delphi
 
-All clients implement the same interface:
-- `connect(host, port)` / `connect_pipe(name)`
-- `push(vector) -> int`
-- `pull(vector) -> [(id, distance)]`
-- `cpull(vector) -> [(id, distance)]`
-- `bpush(vectors) -> int`
+All clients implement:
+- `connect(host, port)`
+- `push(vector, [label]) -> int`
+- `bpush(vector, [label]) -> int`
+- `pull(vector) -> results`
+- `cpull(vector) -> results`
+- `bpull(vector) -> results`
+- `bcpull(vector) -> results`
+- `setLabel(index, label)`
 - `delete(index)`
 - `undo()`
 - `save()`

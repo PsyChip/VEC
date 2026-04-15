@@ -6,12 +6,24 @@ Usage:
 
     vec = VecClient("localhost", 1920)
     idx = vec.push([0.1, 0.2, 0.3])
+    idx = vec.push([0.1, 0.2, 0.3], label="docs/file.pdf?page=2")
     results = vec.pull([0.1, 0.2, 0.3])
     vec.close()
 """
 import socket
 import struct
 import numpy as np
+
+class VecResult:
+    def __init__(self, index, distance, label=None):
+        self.index = index
+        self.distance = distance
+        self.label = label
+
+    def __repr__(self):
+        if self.label:
+            return f"{self.label}:{self.distance:.6f}"
+        return f"{self.index}:{self.distance:.6f}"
 
 class VecClient:
     def __init__(self, host="localhost", port=1920):
@@ -20,6 +32,9 @@ class VecClient:
 
     def _send(self, cmd):
         self.sock.sendall(cmd.encode())
+
+    def _send_bytes(self, data):
+        self.sock.sendall(data)
 
     def _readline(self):
         buf = b""
@@ -34,31 +49,55 @@ class VecClient:
             raise RuntimeError(resp)
         return resp
 
-    def push(self, vector):
+    def push(self, vector, label=None):
         """Push a single vector. Returns slot index."""
         csv = ",".join(f"{v:.6f}" for v in vector)
-        self._send(f"push {csv}\n")
+        if label:
+            self._send(f"push {label} {csv}\n")
+        else:
+            self._send(f"push {csv}\n")
+        return int(self._check_err(self._readline()))
+
+    def bpush(self, vector, label=None):
+        """Binary push - single vector as raw fp32 bytes. Returns slot index."""
+        arr = np.array(vector, dtype=np.float32)
+        if label:
+            self._send(f"bpush {label}\n")
+        else:
+            self._send("bpush\n")
+        self._send_bytes(arr.tobytes())
         return int(self._check_err(self._readline()))
 
     def pull(self, vector):
-        """Query by L2 distance. Returns list of (index, distance) tuples."""
+        """Query by L2 distance. Returns list of VecResult."""
         csv = ",".join(f"{v:.6f}" for v in vector)
         self._send(f"pull {csv}\n")
         return self._parse_results(self._readline())
 
     def cpull(self, vector):
-        """Query by cosine distance. Returns list of (index, distance) tuples."""
+        """Query by cosine distance. Returns list of VecResult."""
         csv = ",".join(f"{v:.6f}" for v in vector)
         self._send(f"cpull {csv}\n")
         return self._parse_results(self._readline())
 
-    def bpush(self, vectors):
-        """Binary bulk push. vectors: numpy array or list of lists. Returns first slot index."""
-        arr = np.array(vectors, dtype=np.float32)
-        count = arr.shape[0]
-        self._send(f"bpush {count}\n")
-        self.sock.sendall(arr.tobytes())
-        return int(self._check_err(self._readline()))
+    def bpull(self, vector):
+        """Binary L2 query - single vector as raw fp32 bytes. Returns list of VecResult."""
+        arr = np.array(vector, dtype=np.float32)
+        self._send("bpull\n")
+        self._send_bytes(arr.tobytes())
+        return self._parse_results(self._readline())
+
+    def bcpull(self, vector):
+        """Binary cosine query - single vector as raw fp32 bytes. Returns list of VecResult."""
+        arr = np.array(vector, dtype=np.float32)
+        self._send("bcpull\n")
+        self._send_bytes(arr.tobytes())
+        return self._parse_results(self._readline())
+
+    def setLabel(self, index, label):
+        """Set or override label for a slot."""
+        self._send(f"label {index} {label}\n")
+        self._check_err(self._readline())
 
     def delete(self, index):
         """Tombstone a vector by slot index."""
@@ -90,8 +129,15 @@ class VecClient:
             return []
         results = []
         for pair in resp.strip().split(","):
-            idx, dist = pair.split(":")
-            results.append((int(idx), float(dist)))
+            idx = pair.rfind(":")
+            if idx < 0:
+                continue
+            key = pair[:idx]
+            dist = float(pair[idx + 1:])
+            try:
+                results.append(VecResult(int(key), dist))
+            except ValueError:
+                results.append(VecResult(-1, dist, label=key))
         return results
 
     def __enter__(self):

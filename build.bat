@@ -11,10 +11,6 @@ echo [build] compiling test.exe...
 cl /O2 /EHsc test.cpp /Fe:test.exe ws2_32.lib /nologo
 if %errorlevel% neq 0 goto fail
 
-echo [build] compiling box.exe...
-cl /O2 /EHsc box.cpp /Fe:box.exe ws2_32.lib /nologo
-if %errorlevel% neq 0 goto fail
-
 echo [build] done.
 del /q *.obj *.lib *.exp *.pdb 2>nul
 goto end

@@ -7,8 +7,9 @@
  *
  * Usage: test <name> <dim> [port]
  *
- * Connects to vec via TCP, pushes 50 random vectors,
- * then queries with both L2 (pull) and cosine (cpull) to show the difference.
+ * Connects to vec via TCP, pushes vectors with labels via bpush,
+ * queries with text (pull/cpull) and binary (bpull/bcpull),
+ * tests label override, verifies results.
  *
  * Build:
  *   cl /O2 /EHsc test.cpp /Fe:test.exe ws2_32.lib
@@ -62,23 +63,25 @@ static void build_query_cmd(char *cmd, const char *prefix, const float *query, i
     *p = '\0';
 }
 
-static void print_results(const char *resp, int pick) {
+static void print_results(const char *resp, const char *pick_label) {
     char buf[4096];
     strncpy(buf, resp, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    printf("  rank  index     distance\n");
-    printf("  ----  --------  ----------\n");
+    printf("  rank  label/index              distance\n");
+    printf("  ----  -----------------------  ----------\n");
 
     int rank = 1;
     char *tok = strtok(buf, ",\n");
     while (tok) {
-        int idx;
-        float dist;
-        if (sscanf(tok, "%d:%f", &idx, &dist) == 2) {
-            printf("  %4d  %8d  %.6f%s\n", rank, idx, dist, idx == pick ? "  <-- MATCH" : "");
-            rank++;
-        }
+        char *last_colon = strrchr(tok, ':');
+        if (!last_colon) { tok = strtok(NULL, ",\n"); continue; }
+        *last_colon = '\0';
+        const char *key = tok;
+        float dist = (float)atof(last_colon + 1);
+        int is_match = (pick_label && strcmp(key, pick_label) == 0);
+        printf("  %4d  %-23s  %.6f%s\n", rank, key, dist, is_match ? "  <-- MATCH" : "");
+        rank++;
         tok = strtok(NULL, ",\n");
     }
 }
@@ -120,7 +123,10 @@ int main(int argc, char **argv) {
 
     for (int d = 0; d < dim; d++) query[d] += randf() * 0.0001f;
 
-    printf("query is noisy copy of vector #%d\n\n", pick);
+    /* generate labels for each vector */
+    char pick_label[128];
+    snprintf(pick_label, sizeof(pick_label), "test/vector_%d?dim=%d", pick, dim);
+    printf("query is noisy copy of vector #%d (label=%s)\n\n", pick, pick_label);
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -162,25 +168,24 @@ int main(int argc, char **argv) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
-    {
-        /* send: bpush <count>\n<raw fp32 bytes> */
-        char header[64];
-        int hlen = sprintf(header, "bpush %d\n", NUM_VECTORS);
+    for (int i = 0; i < NUM_VECTORS; i++) {
+        /* send: bpush label\n<dim*4 bytes> */
+        char header[256];
+        int hlen = sprintf(header, "bpush test/vector_%d?dim=%d\n", i, dim);
         send(s, header, hlen, 0);
 
-        int payload_bytes = NUM_VECTORS * dim * (int)sizeof(float);
+        const char *vec_data = (const char *)(vectors + i * dim);
+        int vec_bytes = dim * (int)sizeof(float);
         int sent = 0;
-        while (sent < payload_bytes) {
-            int chunk = payload_bytes - sent;
-            if (chunk > 65536) chunk = 65536;
-            int r = send(s, (const char *)vectors + sent, chunk, 0);
+        while (sent < vec_bytes) {
+            int r = send(s, vec_data + sent, vec_bytes - sent, 0);
             if (r <= 0) { fprintf(stderr, "ERROR: send failed\n"); goto done; }
             sent += r;
         }
 
         sock_readline(s, resp, sizeof(resp));
         if (strncmp(resp, "err", 3) == 0) {
-            fprintf(stderr, "ERROR on bpush: %s", resp);
+            fprintf(stderr, "ERROR on bpush %d: %s", i, resp);
             goto done;
         }
     }
@@ -193,7 +198,7 @@ int main(int argc, char **argv) {
     QueryPerformanceCounter(&t0);
     sock_command(s, cmd, resp, sizeof(resp));
     QueryPerformanceCounter(&t1);
-    print_results(resp, pick);
+    print_results(resp, pick_label);
     printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
 
     build_query_cmd(cmd, "cpull", query, dim);
@@ -201,8 +206,61 @@ int main(int argc, char **argv) {
     QueryPerformanceCounter(&t0);
     sock_command(s, cmd, resp, sizeof(resp));
     QueryPerformanceCounter(&t1);
-    print_results(resp, pick);
+    print_results(resp, pick_label);
     printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+
+    /* --- bpull: binary L2 query --- */
+    {
+        printf("[L2] bpull (binary):\n");
+        send(s, "bpull\n", 6, 0);
+        int vec_bytes = dim * (int)sizeof(float);
+        int sent = 0;
+        while (sent < vec_bytes) {
+            int r = send(s, (const char *)query + sent, vec_bytes - sent, 0);
+            if (r <= 0) { fprintf(stderr, "ERROR: send failed\n"); goto done; }
+            sent += r;
+        }
+        QueryPerformanceCounter(&t0);
+        sock_readline(s, resp, sizeof(resp));
+        QueryPerformanceCounter(&t1);
+        print_results(resp, pick_label);
+        printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+    }
+
+    /* --- bcpull: binary cosine query --- */
+    {
+        printf("[COSINE] bcpull (binary):\n");
+        send(s, "bcpull\n", 7, 0);
+        int vec_bytes = dim * (int)sizeof(float);
+        int sent = 0;
+        while (sent < vec_bytes) {
+            int r = send(s, (const char *)query + sent, vec_bytes - sent, 0);
+            if (r <= 0) { fprintf(stderr, "ERROR: send failed\n"); goto done; }
+            sent += r;
+        }
+        QueryPerformanceCounter(&t0);
+        sock_readline(s, resp, sizeof(resp));
+        QueryPerformanceCounter(&t1);
+        print_results(resp, pick_label);
+        printf("  time: %.3f ms\n\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+    }
+
+    /* --- label override test --- */
+    {
+        printf("label override test:\n");
+        char lcmd[256];
+        sprintf(lcmd, "label %d relabeled/vector_%d\n", pick, pick);
+        sock_command(s, lcmd, resp, sizeof(resp));
+        printf("  label %d -> %s", pick, resp);
+
+        /* re-query to see updated label */
+        build_query_cmd(cmd, "pull", query, dim);
+        sock_command(s, cmd, resp, sizeof(resp));
+        char relabel[128];
+        snprintf(relabel, sizeof(relabel), "relabeled/vector_%d", pick);
+        print_results(resp, relabel);
+        printf("\n");
+    }
 
     sock_command(s, "size\n", resp, sizeof(resp));
     printf("size: %s", resp);

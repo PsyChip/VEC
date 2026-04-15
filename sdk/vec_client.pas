@@ -5,6 +5,7 @@
     var Vec: TVecClient;
     Vec := TVecClient.Create('localhost', 1920);
     idx := Vec.Push(myVector);
+    idx := Vec.PushLabeled('docs/file.pdf?page=2', myVector);
     results := Vec.Pull(queryVector);
     Vec.Free;
 
@@ -21,6 +22,7 @@ type
   TVecResult = record
     Index: Integer;
     Distance: Single;
+    Label_: string;
   end;
 
   TVecResults = array of TVecResult;
@@ -43,9 +45,14 @@ type
     function ConnectTCP(const Host: string; Port: Integer = 1920): Boolean;
     function ConnectPipe(const Name: string): Boolean;
     function Push(const Vec: TSingleArray): Integer;
+    function PushLabeled(const ALabel: string; const Vec: TSingleArray): Integer;
+    function BPush(const Vec: TSingleArray): Integer;
+    function BPushLabeled(const ALabel: string; const Vec: TSingleArray): Integer;
     function Pull(const Vec: TSingleArray): TVecResults;
     function CPull(const Vec: TSingleArray): TVecResults;
-    function BPush(const Vectors: array of Single; Count, Dim: Integer): Integer;
+    function BPull(const Vec: TSingleArray): TVecResults;
+    function BCPull(const Vec: TSingleArray): TVecResults;
+    procedure SetLabel(Index: Integer; const ALabel: string);
     procedure Delete(Index: Integer);
     procedure Undo;
     procedure Save;
@@ -191,8 +198,9 @@ end;
 function TVecClient.ParseResults(const S: string): TVecResults;
 var
   Pairs: TArray<string>;
-  Parts: TArray<string>;
-  I: Integer;
+  I, ColonPos: Integer;
+  Key: string;
+  Val: Integer;
 begin
   if (S = '') or (Copy(S, 1, 3) = 'err') then begin
     CheckError(S);
@@ -203,10 +211,17 @@ begin
   Pairs := S.Split([',']);
   SetLength(Result, Length(Pairs));
   for I := 0 to Length(Pairs) - 1 do begin
-    Parts := Pairs[I].Split([':']);
-    if Length(Parts) = 2 then begin
-      Result[I].Index := StrToIntDef(Parts[0], -1);
-      Result[I].Distance := StrToFloatDef(Parts[1], 0);
+    { find last colon - label may not contain colons }
+    ColonPos := Pairs[I].LastIndexOf(':');
+    if ColonPos < 0 then Continue;
+    Key := Copy(Pairs[I], 1, ColonPos);
+    Result[I].Distance := StrToFloatDef(Copy(Pairs[I], ColonPos + 2, MaxInt), 0);
+    Result[I].Label_ := '';
+    if TryStrToInt(Key, Val) then
+      Result[I].Index := Val
+    else begin
+      Result[I].Index := -1;
+      Result[I].Label_ := Key;
     end;
   end;
 end;
@@ -216,6 +231,38 @@ var
   Resp: string;
 begin
   SendStr('push ' + VecToCSV(Vec) + #10);
+  Resp := ReadLine;
+  CheckError(Resp);
+  Result := StrToInt(Resp);
+end;
+
+function TVecClient.PushLabeled(const ALabel: string; const Vec: TSingleArray): Integer;
+var
+  Resp: string;
+begin
+  SendStr('push ' + ALabel + ' ' + VecToCSV(Vec) + #10);
+  Resp := ReadLine;
+  CheckError(Resp);
+  Result := StrToInt(Resp);
+end;
+
+function TVecClient.BPush(const Vec: TSingleArray): Integer;
+var
+  Resp: string;
+begin
+  SendStr('bpush' + #10);
+  SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
+  Resp := ReadLine;
+  CheckError(Resp);
+  Result := StrToInt(Resp);
+end;
+
+function TVecClient.BPushLabeled(const ALabel: string; const Vec: TSingleArray): Integer;
+var
+  Resp: string;
+begin
+  SendStr('bpush ' + ALabel + #10);
+  SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
   Resp := ReadLine;
   CheckError(Resp);
   Result := StrToInt(Resp);
@@ -233,16 +280,24 @@ begin
   Result := ParseResults(ReadLine);
 end;
 
-function TVecClient.BPush(const Vectors: array of Single; Count, Dim: Integer): Integer;
-var
-  Header, Resp: string;
+function TVecClient.BPull(const Vec: TSingleArray): TVecResults;
 begin
-  Header := 'bpush ' + IntToStr(Count) + #10;
-  SendStr(Header);
-  SendBytes(@Vectors[0], Count * Dim * SizeOf(Single));
-  Resp := ReadLine;
-  CheckError(Resp);
-  Result := StrToInt(Resp);
+  SendStr('bpull' + #10);
+  SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
+  Result := ParseResults(ReadLine);
+end;
+
+function TVecClient.BCPull(const Vec: TSingleArray): TVecResults;
+begin
+  SendStr('bcpull' + #10);
+  SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
+  Result := ParseResults(ReadLine);
+end;
+
+procedure TVecClient.SetLabel(Index: Integer; const ALabel: string);
+begin
+  SendStr('label ' + IntToStr(Index) + ' ' + ALabel + #10);
+  CheckError(ReadLine);
 end;
 
 procedure TVecClient.Delete(Index: Integer);

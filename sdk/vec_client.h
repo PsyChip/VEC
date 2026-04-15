@@ -4,6 +4,7 @@
  * Usage:
  *   VecClient vec("localhost", 1920);
  *   int idx = vec.push(vector, 1024);
+ *   int idx = vec.push("docs/file.pdf?page=2", vector, 1024);
  *   VecResult results[10];
  *   int n = vec.pull(vector, 1024, results, 10);
  *   vec.close();
@@ -41,6 +42,7 @@ typedef int vec_sock_t;
 struct VecResult {
     int index;
     float distance;
+    char label[512];
 };
 
 class VecClient {
@@ -68,6 +70,16 @@ class VecClient {
             sent += r;
         }
         return sent;
+    }
+
+    void fmt_vec(char *cmd, const char *prefix, const float *vec, int dim) {
+        char *p = cmd;
+        p += sprintf(p, "%s ", prefix);
+        for (int i = 0; i < dim; i++) {
+            if (i > 0) *p++ = ',';
+            p += sprintf(p, "%.6f", vec[i]);
+        }
+        *p++ = '\n'; *p = '\0';
     }
 
 public:
@@ -115,28 +127,43 @@ public:
     }
 #endif
 
-#ifdef _WIN32
-    int connect_pipe(const char *name) {
-        char pipe_name[256];
-        snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\vec_%s", name);
-        HANDLE pipe = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (pipe == INVALID_HANDLE_VALUE) return -1;
-        /* wrap pipe handle as socket - not directly compatible, use TCP instead */
-        CloseHandle(pipe);
-        return -1; /* pipe mode not supported in this SDK, use TCP */
-    }
-#endif
-
     int push(const float *vec, int dim) {
         char cmd[65536];
+        fmt_vec(cmd, "push", vec, dim);
+        send_all(cmd, (int)strlen(cmd));
+        readline(rbuf, sizeof(rbuf));
+        if (strncmp(rbuf, "err", 3) == 0) return -1;
+        return atoi(rbuf);
+    }
+
+    int push(const char *label, const float *vec, int dim) {
+        char cmd[65536];
         char *p = cmd;
-        p += sprintf(p, "push ");
+        p += sprintf(p, "push %s ", label);
         for (int i = 0; i < dim; i++) {
             if (i > 0) *p++ = ',';
             p += sprintf(p, "%.6f", vec[i]);
         }
         *p++ = '\n'; *p = '\0';
         send_all(cmd, (int)(p - cmd));
+        readline(rbuf, sizeof(rbuf));
+        if (strncmp(rbuf, "err", 3) == 0) return -1;
+        return atoi(rbuf);
+    }
+
+    int bpush(const float *vec, int dim) {
+        send_all("bpush\n", 6);
+        send_all((const char *)vec, dim * (int)sizeof(float));
+        readline(rbuf, sizeof(rbuf));
+        if (strncmp(rbuf, "err", 3) == 0) return -1;
+        return atoi(rbuf);
+    }
+
+    int bpush(const char *label, const float *vec, int dim) {
+        char header[1024];
+        int hlen = sprintf(header, "bpush %s\n", label);
+        send_all(header, hlen);
+        send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
         if (strncmp(rbuf, "err", 3) == 0) return -1;
         return atoi(rbuf);
@@ -144,40 +171,40 @@ public:
 
     int pull(const float *vec, int dim, VecResult *results, int max_results) {
         char cmd[65536];
-        char *p = cmd;
-        p += sprintf(p, "pull ");
-        for (int i = 0; i < dim; i++) {
-            if (i > 0) *p++ = ',';
-            p += sprintf(p, "%.6f", vec[i]);
-        }
-        *p++ = '\n'; *p = '\0';
-        send_all(cmd, (int)(p - cmd));
+        fmt_vec(cmd, "pull", vec, dim);
+        send_all(cmd, (int)strlen(cmd));
         readline(rbuf, sizeof(rbuf));
         return parse_results(rbuf, results, max_results);
     }
 
     int cpull(const float *vec, int dim, VecResult *results, int max_results) {
         char cmd[65536];
-        char *p = cmd;
-        p += sprintf(p, "cpull ");
-        for (int i = 0; i < dim; i++) {
-            if (i > 0) *p++ = ',';
-            p += sprintf(p, "%.6f", vec[i]);
-        }
-        *p++ = '\n'; *p = '\0';
-        send_all(cmd, (int)(p - cmd));
+        fmt_vec(cmd, "cpull", vec, dim);
+        send_all(cmd, (int)strlen(cmd));
         readline(rbuf, sizeof(rbuf));
         return parse_results(rbuf, results, max_results);
     }
 
-    int bpush(const float *vectors, int count, int dim) {
-        char header[64];
-        int hlen = sprintf(header, "bpush %d\n", count);
-        send_all(header, hlen);
-        send_all((const char *)vectors, count * dim * (int)sizeof(float));
+    int bpull(const float *vec, int dim, VecResult *results, int max_results) {
+        send_all("bpull\n", 6);
+        send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
-        if (strncmp(rbuf, "err", 3) == 0) return -1;
-        return atoi(rbuf);
+        return parse_results(rbuf, results, max_results);
+    }
+
+    int bcpull(const float *vec, int dim, VecResult *results, int max_results) {
+        send_all("bcpull\n", 7);
+        send_all((const char *)vec, dim * (int)sizeof(float));
+        readline(rbuf, sizeof(rbuf));
+        return parse_results(rbuf, results, max_results);
+    }
+
+    int setLabel(int index, const char *label) {
+        char cmd[1024];
+        int len = sprintf(cmd, "label %d %s\n", index, label);
+        send_all(cmd, len);
+        readline(rbuf, sizeof(rbuf));
+        return (strncmp(rbuf, "err", 3) == 0) ? -1 : 0;
     }
 
     int vec_delete(int index) {
@@ -218,14 +245,36 @@ public:
         int n = 0;
         const char *p = resp;
         while (*p && n < max_results) {
-            results[n].index = atoi(p);
-            const char *colon = strchr(p, ':');
-            if (!colon) break;
-            results[n].distance = (float)atof(colon + 1);
+            /* find the last colon in this result (before comma or end) */
+            const char *end = strchr(p, ',');
+            if (!end) end = p + strlen(p);
+            const char *last_colon = NULL;
+            for (const char *s = end - 1; s >= p; s--) {
+                if (*s == ':') { last_colon = s; break; }
+            }
+            if (!last_colon) break;
+
+            /* everything before last colon = label or index */
+            int label_len = (int)(last_colon - p);
+            results[n].distance = (float)atof(last_colon + 1);
+            results[n].label[0] = '\0';
+
+            /* check if it's a numeric index or a label */
+            char tmp[512];
+            if (label_len < (int)sizeof(tmp)) {
+                memcpy(tmp, p, label_len);
+                tmp[label_len] = '\0';
+                char *endptr;
+                long idx = strtol(tmp, &endptr, 10);
+                if (*endptr == '\0') {
+                    results[n].index = (int)idx;
+                } else {
+                    results[n].index = -1;
+                    strncpy(results[n].label, tmp, sizeof(results[n].label) - 1);
+                }
+            }
             n++;
-            const char *comma = strchr(p, ',');
-            if (!comma) break;
-            p = comma + 1;
+            p = (*end == ',') ? end + 1 : end;
         }
         return n;
     }

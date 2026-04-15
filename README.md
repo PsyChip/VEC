@@ -10,7 +10,7 @@ Single exe. ~300KB. No libraries. No dependencies. No configuration. Works like 
 vec mydb 1024
 ```
 
-That's it. Push over TCP, query over TCP. Ctrl+C saves to disk. Designed for NVIDIA CUDA GPUs, currently Windows only. Linux is planned.
+That's it. Push over TCP, query over TCP. Ctrl+C saves to disk. Designed for NVIDIA CUDA GPUs. Windows and Linux.
 
 ---
 
@@ -48,17 +48,19 @@ Bottleneck is pure memory bandwidth.
 
 ## How it works
 
-**VEC** is a TCP/Pipe server that holds vectors in GPU VRAM. Like Redis or memcached, but for vector similarity search.
+**VEC** is a TCP/pipe server that holds vectors in GPU VRAM. Like Redis or memcached, but for vector similarity search.
 
-- Stores and computes in native **fp32** - what you push is exactly what gets searched
+- Stores and computes in native **fp32** (fp16 optional for 2x capacity)
 - **Two distance metrics**: L2 (Euclidean) and cosine - selectable per query, no rebuild
 - **Brute-force search** - no indexing, no approximation, exact results every time
 - Returns **top 10 nearest neighbors** per query
-- **Undo** last push for quick rollback
-- Persists to `.tensors` binary file on disk
+- **Labels** - attach metadata to vectors, returned in query results
+- **Binary protocol** - bpush/bpull/bcpull for raw fp32 bytes, skips text parsing
+- Persists to `.tensors` binary file with CRC32 checksum
+- Labels persisted to `.meta` sidecar file
 - Auto-loads from disk on startup, auto-saves on Ctrl+C
-- Supports multiple instances on different ports for different datasets
-- No preprocessing, no postprocessing, no normalization - zero data transformation
+- Multiple instances on different ports for different datasets
+- No preprocessing, no normalization - zero data transformation
 
 ---
 
@@ -66,52 +68,91 @@ Bottleneck is pure memory bandwidth.
 
 ### Requirements
 
-- Windows 10/11 (64-bit)
+- Windows 10/11 or Linux (64-bit)
 - NVIDIA GPU (Turing or newer)
-- NVIDIA display drivers (Game Ready or Studio - that's it, no CUDA Toolkit needed)
+- NVIDIA display drivers (no CUDA Toolkit needed on target)
 
 ### Usage
 
-```cmd
+```
 vec <name> [dim[:format]] [port]
 vec <path/to/file.tensors> [port]
 ```
 
-```cmd
+```
 vec                        :: random name, 1024 dim, fp32, port 1920
-vec mydb                   :: auto-detect from existing .tensors file or create 1024/fp32
+vec mydb                   :: auto-detect from existing file or create 1024/fp32
 vec mydb 1024              :: fp32 (default)
 vec mydb 1024:f16          :: fp16 storage, 2x capacity
 vec mydb 1024 1921         :: custom port
-vec mydb 1024:f16 1921     :: fp16 + custom port
-vec mydb.tensors           :: load directly from file, read params from header
-vec "d:\data\mydb_1024_f16.tensors"  :: load from full path
+vec mydb.tensors           :: load directly from file
 ```
 
-Each instance gets its own TCP port, named pipe (`\\.\pipe\vec_<name>`), and save file (`<name>.tensors`). Duplicate names are blocked automatically.
+Each instance gets its own TCP port, named pipe/unix socket, and save file. Duplicate names are blocked automatically.
+
+### File discovery
+
+```
+vec mydb                       :: finds mydb_1024_f32.tensors (+ mydb_1024_f32.meta if exists)
+vec mydb_1024_f32.tensors      :: loads directly, reads dim/format from file header
+vec                            :: random name, fresh database
+```
+
+On save, vec writes `<name>_<dim>_<format>.tensors` and optionally `<name>_<dim>_<format>.meta` (only when labels exist). Both files must be in the same directory. If `.meta` is missing, vec loads without labels. If `.tensors` is missing, vec starts a fresh database.
 
 ---
 
 ## Protocol
 
-Plain text over TCP. One command in, one line out. Identical on named pipe.
+Plain text over TCP. One command in, one line out. Identical on named pipe (Windows) and unix socket (Linux).
 
 | Command | Example | Response |
 |---|---|---|
-| **push** | `push 0.12,0.45,0.78,...\n` | `42\n` (slot index) |
-| **pull** | `pull 0.12,0.45,0.78,...\n` | `0:0.0012,5:0.0451,...\n` |
-| **cpull** | `cpull 0.12,0.45,0.78,...\n` | `0:0.0012,5:0.0451,...\n` |
-| **bpush** | `bpush 1000\n` + raw fp32 bytes | `0\n` (first slot index) |
+| **push** | `push docs/file.pdf?page=2 0.12,0.45,...\n` | `42\n` |
+| **push** | `push 0.12,0.45,...\n` | `42\n` (no label) |
+| **bpush** | `bpush docs/file.pdf?page=2\n` + raw bytes | `42\n` |
+| **bpush** | `bpush\n` + raw bytes | `42\n` (no label) |
+| **pull** | `pull 0.12,0.45,...\n` | `docs/file.pdf?page=2:0.0012,...\n` |
+| **cpull** | `cpull 0.12,0.45,...\n` | `docs/file.pdf?page=2:0.0012,...\n` |
+| **bpull** | `bpull\n` + raw bytes | `docs/file.pdf?page=2:0.0012,...\n` |
+| **bcpull** | `bcpull\n` + raw bytes | `docs/file.pdf?page=2:0.0012,...\n` |
+| **label** | `label 42 docs/file.pdf?page=2\n` | `ok\n` |
 | **delete** | `delete 42\n` | `ok\n` |
 | **undo** | `undo\n` | `ok\n` |
 | **save** | `save\n` | `ok\n` |
 | **size** | `size\n` | `50\n` |
 
-**push** - send a vector as comma-separated fp32 floats. Returns the slot index. Save this number - it's your key.
+### Push
 
-**pull** - query by **L2 (Euclidean) distance**. Best for vision models (DINOv2, ArcFace). Measures how far apart two vectors are in space. Cares about both direction and magnitude.
+Send a vector as comma-separated fp32 floats with optional label.
 
-**cpull** - query by **cosine distance**. Best for text embeddings (BGE, MiniLM). Measures the angle between two vectors. Only cares about direction, ignores magnitude. Same data, different metric - no rebuild needed. Unlike FAISS which locks you into one metric at index creation, VEC lets you choose per query.
+```
+push docs/report.pdf?page=2&chunk=4 0.123,0.456,0.789,...\n
+-> 42
+```
+
+Label is everything before the first float. No label = index-only.
+
+### Binary push
+
+Same as push but vector is raw fp32 bytes. Faster for high-dimensional vectors.
+
+```
+bpush docs/report.pdf?page=2\n
+<dim * 4 bytes of little-endian fp32 data>
+-> 42
+```
+
+### Query (pull / cpull / bpull / bcpull)
+
+`pull` = L2 distance, `cpull` = cosine distance. `bpull`/`bcpull` = binary query (raw bytes).
+
+```
+pull 0.123,0.456,0.789,...\n
+-> docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100,42:0.234000
+```
+
+Results are `label:distance` pairs (or `index:distance` when no label), comma-separated, nearest first. Up to 10 results.
 
 ### L2 vs Cosine
 
@@ -120,16 +161,13 @@ Plain text over TCP. One command in, one line out. Identical on named pipe.
 
   How far apart are they?            Are they looking the same way?
 
-       A                                  A ·
-      ·                                    /
-     /        B                           /        B ·
-    /        ·                           /          /
+       A                                  A .
+      .                                    /
+     /        B                           /        B .
+    /        .                           /          /
    /  <----->                           /     angle/
-  ·  distance ·                        ·----------·
+  .  distance .                        .----------.
                                          direction
-
-  "Two clouds - we measure             "Two clouds - we measure
-   the gap between them"                where they're pointing"
 
   Sensitive to magnitude:              Ignores magnitude:
   [1,0] vs [10,0] = far               [1,0] vs [10,0] = same direction
@@ -138,13 +176,20 @@ Plain text over TCP. One command in, one line out. Identical on named pipe.
   (DINOv2, ArcFace)                    (BGE, MiniLM, CLIP text)
 ```
 
-**bpush** - binary bulk push. Send `bpush N\n` followed by `N * dim * 4` bytes of raw fp32 data. ~100x faster than text push.
+### Labels
 
-**delete** - tombstones a slot. Excluded from future queries. Index is preserved, never reused.
+Labels are metadata strings attached to vectors. They appear in query results instead of numeric indices.
 
-**undo** - removes the last pushed vector. The slot index is reclaimed and reused by the next push.
+```
+label 42 docs/report.pdf?page=2\n
+-> ok
+```
 
-**Errors** return `err <message>\n`:
+Labels must not contain colons or commas (stripped with warning). Use URI-style paths without scheme prefix. Labels are saved to a `.meta` sidecar file alongside `.tensors`.
+
+### Errors
+
+All errors start with `err`:
 ```
 err dim mismatch: got 3, expected 1024
 err index out of range
@@ -172,12 +217,24 @@ All embedding models output fp32. VEC stores fp32 natively - no conversion, no p
 ### Requirements
 
 - NVIDIA CUDA Toolkit 12.x
-- MSVC Build Tools (v14.41 or older - v14.44 has known cudafe++ crashes)
-- Windows SDK
+- Windows: MSVC Build Tools (v14.41 or older)
+- Linux: gcc + nvcc
 
-### Build
+### Windows
 
 ```cmd
+build.bat
+```
+
+### Linux
+
+```bash
+./build.sh
+```
+
+### Manual build
+
+```
 nvcc -O2 -c vec_kernel.cu -o vec_kernel.obj ^
   -gencode arch=compute_75,code=sm_75 ^
   -gencode arch=compute_86,code=sm_86 ^
@@ -189,12 +246,6 @@ nvcc -O2 vec_kernel.obj vec.cpp -o vec.exe -lws2_32 ^
   -gencode arch=compute_89,code=sm_89
 ```
 
-| Flag | What it does |
-|---|---|
-| `sm_75` | Native code for Turing |
-| `sm_86` | Native code for Ampere |
-| `sm_89` | Native code for Ada Lovelace |
-
 CUDA runtime is statically linked - the output exe needs nothing but NVIDIA display drivers on the target machine.
 
 ### Test client
@@ -203,7 +254,7 @@ CUDA runtime is statically linked - the output exe needs nothing but NVIDIA disp
 cl /O2 /EHsc test.cpp /Fe:test.exe ws2_32.lib
 ```
 
-```cmd
+```
 :: Terminal 1
 vec mydb 1024
 
@@ -211,89 +262,38 @@ vec mydb 1024
 test mydb 1024
 ```
 
-Pushes 1000 random vectors, queries a noisy copy with both L2 and cosine distance, verifies the original comes back as rank 1.
-
----
-
-## BOX - companion string store
-
-**box** is a memory-resident key-value string store that shares the same index space with vec. Push a vector to vec, push metadata to box - both return the same index. Query vec for similar vectors, use the indices to look up metadata in box.
-
-```cmd
-:: Terminal 1 - vector store
-vec mydb 1024
-
-:: Terminal 2 - metadata store
-box mydb 255 2020
-```
-
-### Typical workflow
-
-```
-vec:  push 0.12,0.45,...   -> 42
-box:  push {"name":"cat","file":"img_042.jpg"}   -> 42
-
-vec:  pull 0.11,0.44,...   -> 42:0.0012,17:0.0891,...
-box:  pull 42              -> {"name":"cat","file":"img_042.jpg"}
-box:  pull 17              -> {"name":"dog","file":"img_017.jpg"}
-```
-
-### Protocol
-
-Same style as vec. TCP port 2020 (default) and named pipe `\\.\pipe\box_<name>`.
-
-| Command | Example | Response |
-|---|---|---|
-| **push** | `push hello world\n` | `0\n` |
-| **pull** | `pull 0\n` | `hello world\n` |
-| **delete** | `delete 0\n` | `ok\n` |
-| **undo** | `undo\n` | `ok\n` |
-| **save** | `save\n` | `ok\n` |
-| **size** | `size\n` | `50\n` |
-
-### Usage
-
-```cmd
-box <name> [slot_size] [port]
-```
-
-```cmd
-box mydb              :: 255 byte slots, port 2020
-box mydb 512          :: 512 byte slots
-box mydb 255 2021     :: custom port
-```
-
-Stores UTF-8 strings. Persists to `<name>.mem` file. No GPU required.
-
-### Build
-
-```cmd
-cl /O2 /EHsc box.cpp /Fe:box.exe ws2_32.lib
-```
+Pushes 50 random vectors with labels, queries with L2 and cosine, verifies the original comes back as rank 1.
 
 ---
 
 ## Internals
 
-**Two source files.** `vec_kernel.cu` has the CUDA kernels, `vec.cpp` has host code. Split is required because CUDA's cudafe++ crashes on Win32/Winsock headers.
+**Single source file.** `vec.cpp` has both Windows and Linux code separated by `#ifdef _WIN32`. `vec_kernel.cu` has the CUDA kernels. Split is required because CUDA's cudafe++ crashes on Win32/Winsock headers.
 
-**Native fp32.** Vectors stored as fp32 on GPU and on disk. No conversion, no quantization. What you push is what gets searched.
-
-**Grow-on-demand.** GPU buffer starts small, doubles on realloc with device-to-device `cudaMemcpy`. Pinned host memory (`cudaMallocHost`) for fast PCIe transfers.
-
-**Networking.** TCP uses thread-per-client with `select` on the listen socket. Named pipe uses Win32 overlapped I/O. Instance locking via Windows named mutex.
+**Vectors on GPU, labels on CPU.** Vectors live in VRAM, labels live in system RAM. The GPU kernel never touches labels - they're stapled onto results after the kernel finishes. Zero performance impact.
 
 **File format** (`.tensors`):
 ```
-[4B dim][4B count][4B deleted][count B alive mask][count * dim * 4B fp32 data]
+[4B dim][4B count][4B deleted][1B format][count B alive mask][vector data][4B CRC32]
 ```
+
+**Label format** (`.meta` sidecar, created only when labels exist):
+```
+[4B count][per label: 4B length + string bytes]
+```
+
+**CRC32 checksum** on save, verified on load with pronounceable word (e.g. `NOMITOPO 0xA3F291B7`).
 
 ---
 
+## Good to know
+
 - **Brute force by design.** No ANN index. Every query reads every vector. For up to ~3M vectors on a modern GPU, this is fast enough and gives exact results.
-- **Indices are permanent.** Slot 42 stays slot 42 forever. Delete tombstones but never compacts. Your external ID mapping never goes stale.
+- **Indices are permanent.** Slot 42 stays slot 42 forever. Delete tombstones but never compacts.
+- **Labels are free.** They live in CPU RAM, never touch the GPU. Query performance is identical with or without labels.
+- **Labels are sanitized.** Colons and commas are stripped with a console warning. Whitespace is trimmed.
 - **Named pipe works from scripts.** `echo push 1.0,2.0,3.0 > \\.\pipe\vec_mydb` from cmd or PowerShell.
-- **Save files are straightforward.** fp32 on disk - a million 1024-dim vectors is ~4 GB.
+- **Save files include CRC32.** Corruption is detected on load with a warning.
 
 ---
 
