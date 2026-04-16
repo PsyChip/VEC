@@ -99,6 +99,7 @@ Plain text over TCP. One command in, one line out. Same on named pipe (Windows) 
 | **undo** | `undo\n` | `ok\n` |
 | **save** | `save\n` | `ok\n` |
 | **size** | `size\n` | `50\n` |
+| **dim** | `dim\n` | `1024\n` |
 
 ### Push
 
@@ -311,7 +312,7 @@ Available in `sdk/` directory:
 - `vec_client.js` - Node.js
 - `vec_client.pas` - Delphi
 
-All implement: `push`, `bpush`, `pull`, `cpull`, `bpull`, `bcpull`, `setLabel`, `delete`, `undo`, `save`, `size`.
+All implement: `push`, `bpush`, `pull`, `cpull`, `bpull`, `bcpull`, `setLabel`, `delete`, `undo`, `save`, `size`, `dim`.
 
 ---
 

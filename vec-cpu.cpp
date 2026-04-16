@@ -778,6 +778,12 @@ static int process_command(const char *line, int line_len, write_fn writer, void
         return 0;
     }
 
+    if (line_len >= 3 && strncmp(line, "dim", 3) == 0) {
+        rlen = snprintf(resp, sizeof(resp), "%d\n", g_dim);
+        writer(wctx, resp, rlen);
+        return 0;
+    }
+
     rlen = snprintf(resp, sizeof(resp), "err unknown command\n");
     writer(wctx, resp, rlen);
     return 0;
@@ -967,7 +973,8 @@ static void print_help() {
     printf("  delete <idx>                     tombstone vector\n");
     printf("  undo                             remove last push\n");
     printf("  save                             flush to disk\n");
-    printf("  size                             total record count\n\n");
+    printf("  size                             total record count\n");
+    printf("  dim                              vector dimension\n\n");
     printf("router mode:\n");
     printf("  start instances with --notcp, then route them through one port:\n");
     printf("  vec --notcp tools 1024\n");
@@ -990,10 +997,17 @@ struct route_entry {
     int fd;
 #endif
     int connected;
+    int dim;
 };
 
 static route_entry g_routes[MAX_ROUTES];
 static int g_route_count = 0;
+
+static int router_is_binary(const char *cmd, int cmd_len) {
+    return (cmd_len >= 5 && strncmp(cmd, "bpush", 5) == 0) ||
+           (cmd_len >= 5 && strncmp(cmd, "bpull", 5) == 0) ||
+           (cmd_len >= 6 && strncmp(cmd, "bcpull", 6) == 0);
+}
 
 #ifdef _WIN32
 
@@ -1026,11 +1040,17 @@ static int router_connect(route_entry *r) {
     return 1;
 }
 
-static int router_send_recv(route_entry *r, const char *data, int data_len, char *resp, int resp_max) {
+static int router_send_recv(route_entry *r, const char *data, int data_len,
+                            const char *bin, int bin_len, char *resp, int resp_max) {
     if (!router_connect(r)) return -1;
     DWORD written;
     if (!WriteFile(r->pipe, data, data_len, &written, NULL)) {
         CloseHandle(r->pipe); r->pipe = INVALID_HANDLE_VALUE; r->connected = 0; return -1;
+    }
+    if (bin && bin_len > 0) {
+        if (!WriteFile(r->pipe, bin, bin_len, &written, NULL)) {
+            CloseHandle(r->pipe); r->pipe = INVALID_HANDLE_VALUE; r->connected = 0; return -1;
+        }
     }
     FlushFileBuffers(r->pipe);
     int total = 0;
@@ -1042,6 +1062,22 @@ static int router_send_recv(route_entry *r, const char *data, int data_len, char
     }
     resp[total] = '\0';
     return total;
+}
+
+static void router_query_dim(route_entry *r) {
+    char resp[64];
+    int rlen = router_send_recv(r, "dim\n", 4, NULL, 0, resp, sizeof(resp));
+    if (rlen > 0) r->dim = atoi(resp);
+}
+
+static int router_recv_exact(SOCKET s, char *buf, int need) {
+    int got = 0;
+    while (got < need) {
+        int r = recv(s, buf + got, need - got, 0);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return got;
 }
 
 static DWORD WINAPI router_client_thread(LPVOID param) {
@@ -1081,7 +1117,12 @@ static DWORD WINAPI router_client_thread(LPVOID param) {
             if (!route) {
                 int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
                 send(client, resp, rlen, 0);
+                int consumed = line_len + 1;
+                buf_used -= consumed;
+                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
             } else {
+                if (route->dim == 0) router_query_dim(route);
+                int is_bin = router_is_binary(buf, cmd_len) && route->dim > 0;
                 /* rebuild as: command [args...]\n (strip namespace) */
                 char fwd[65536];
                 int fwd_len = 0;
@@ -1093,13 +1134,32 @@ static DWORD WINAPI router_client_thread(LPVOID param) {
                     fwd_len += line_len - rest_off;
                 }
                 fwd[fwd_len] = '\n';
-                int rlen = router_send_recv(route, fwd, fwd_len + 1, resp, sizeof(resp));
-                if (rlen > 0) send(client, resp, rlen, 0);
-                else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                fwd_len++;
+                int consumed = line_len + 1;
+                buf_used -= consumed;
+                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
+                if (is_bin) {
+                    int payload = route->dim * (int)sizeof(float);
+                    char *bin = (char *)malloc(payload);
+                    int have = (buf_used < payload) ? buf_used : payload;
+                    if (have > 0) memcpy(bin, buf, have);
+                    if (have < payload) {
+                        if (router_recv_exact(client, bin + have, payload - have) < 0) {
+                            free(bin); break;
+                        }
+                    }
+                    buf_used -= have;
+                    if (buf_used > 0) memmove(buf, buf + have, buf_used);
+                    int rlen = router_send_recv(route, fwd, fwd_len, bin, payload, resp, sizeof(resp));
+                    free(bin);
+                    if (rlen > 0) send(client, resp, rlen, 0);
+                    else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                } else {
+                    int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
+                    if (rlen > 0) send(client, resp, rlen, 0);
+                    else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                }
             }
-            int consumed = line_len + 1;
-            buf_used -= consumed;
-            if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
         }
     }
     closesocket(client);
@@ -1175,9 +1235,13 @@ static int router_connect(route_entry *r) {
     return 1;
 }
 
-static int router_send_recv(route_entry *r, const char *data, int data_len, char *resp, int resp_max) {
+static int router_send_recv(route_entry *r, const char *data, int data_len,
+                            const char *bin, int bin_len, char *resp, int resp_max) {
     if (!router_connect(r)) return -1;
     if (send(r->fd, data, data_len, 0) <= 0) { close(r->fd); r->fd = -1; r->connected = 0; return -1; }
+    if (bin && bin_len > 0) {
+        if (send(r->fd, bin, bin_len, 0) <= 0) { close(r->fd); r->fd = -1; r->connected = 0; return -1; }
+    }
     int total = 0;
     while (total < resp_max - 1) {
         int rd = recv(r->fd, resp + total, 1, 0);
@@ -1187,6 +1251,22 @@ static int router_send_recv(route_entry *r, const char *data, int data_len, char
     }
     resp[total] = '\0';
     return total;
+}
+
+static void router_query_dim(route_entry *r) {
+    char resp[64];
+    int rlen = router_send_recv(r, "dim\n", 4, NULL, 0, resp, sizeof(resp));
+    if (rlen > 0) r->dim = atoi(resp);
+}
+
+static int router_recv_exact(int s, char *buf, int need) {
+    int got = 0;
+    while (got < need) {
+        int r = recv(s, buf + got, need - got, 0);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return got;
 }
 
 static void *router_client_thread(void *param) {
@@ -1226,7 +1306,12 @@ static void *router_client_thread(void *param) {
             if (!route) {
                 int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
                 send(client, resp, rlen, 0);
+                int consumed = line_len + 1;
+                buf_used -= consumed;
+                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
             } else {
+                if (route->dim == 0) router_query_dim(route);
+                int is_bin = router_is_binary(buf, cmd_len) && route->dim > 0;
                 /* rebuild as: command [args...]\n (strip namespace) */
                 char fwd[65536];
                 int fwd_len = 0;
@@ -1238,13 +1323,32 @@ static void *router_client_thread(void *param) {
                     fwd_len += line_len - rest_off;
                 }
                 fwd[fwd_len] = '\n';
-                int rlen = router_send_recv(route, fwd, fwd_len + 1, resp, sizeof(resp));
-                if (rlen > 0) send(client, resp, rlen, 0);
-                else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                fwd_len++;
+                int consumed = line_len + 1;
+                buf_used -= consumed;
+                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
+                if (is_bin) {
+                    int payload = route->dim * (int)sizeof(float);
+                    char *bin = (char *)malloc(payload);
+                    int have = (buf_used < payload) ? buf_used : payload;
+                    if (have > 0) memcpy(bin, buf, have);
+                    if (have < payload) {
+                        if (router_recv_exact(client, bin + have, payload - have) < 0) {
+                            free(bin); break;
+                        }
+                    }
+                    buf_used -= have;
+                    if (buf_used > 0) memmove(buf, buf + have, buf_used);
+                    int rlen = router_send_recv(route, fwd, fwd_len, bin, payload, resp, sizeof(resp));
+                    free(bin);
+                    if (rlen > 0) send(client, resp, rlen, 0);
+                    else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                } else {
+                    int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
+                    if (rlen > 0) send(client, resp, rlen, 0);
+                    else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                }
             }
-            int consumed = line_len + 1;
-            buf_used -= consumed;
-            if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
         }
     }
     close(client);

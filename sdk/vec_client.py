@@ -124,6 +124,11 @@ class VecClient:
         self._send(f"size {self._ns}\n")
         return int(self._readline())
 
+    def dim(self):
+        """Return vector dimension."""
+        self._send(f"dim {self._ns}\n")
+        return int(self._readline())
+
     def close(self):
         """Close connection."""
         self.sock.close()

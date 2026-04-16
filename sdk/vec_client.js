@@ -130,6 +130,11 @@ class VecClient {
         return parseInt(resp);
     }
 
+    async dim() {
+        const resp = await this._command(`dim ${this._ns}\n`);
+        return parseInt(resp);
+    }
+
     close() {
         if (this.sock) this.sock.destroy();
     }

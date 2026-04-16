@@ -258,6 +258,14 @@ public:
         return atoi(rbuf);
     }
 
+    int dim() {
+        char cmd[256];
+        int len = sprintf(cmd, "dim %s\n", ns_prefix);
+        send_all(cmd, len);
+        readline(rbuf, sizeof(rbuf));
+        return atoi(rbuf);
+    }
+
     void close() {
         if (sock != VEC_INVALID_SOCK) {
             vec_close_sock(sock);

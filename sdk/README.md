@@ -27,6 +27,7 @@ TCP text protocol. One command per line (`\n` terminated), one response per line
 | undo | `undo\n` | `ok\n` |
 | save | `save\n` | `ok\n` |
 | size | `size\n` | `<count>\n` |
+| dim | `dim\n` | `<dimension>\n` |
 
 ### Push
 
@@ -140,6 +141,7 @@ delete(index)
 undo()
 save()
 size() -> int
+dim() -> int
 close()
 ```
 

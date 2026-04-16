@@ -66,6 +66,7 @@ type
     procedure Undo;
     procedure Save;
     function Size: Integer;
+    function Dim: Integer;
     procedure Close;
     destructor Destroy; override;
     property Connected: Boolean read FConnected;
@@ -340,6 +341,12 @@ end;
 function TVecClient.Size: Integer;
 begin
   SendStr('size ' + NsPrefix + #10);
+  Result := StrToInt(ReadLine);
+end;
+
+function TVecClient.Dim: Integer;
+begin
+  SendStr('dim ' + NsPrefix + #10);
   Result := StrToInt(ReadLine);
 end;
 
