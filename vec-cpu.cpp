@@ -3,12 +3,11 @@
  * root@psychip.net
  * April 2026
  *
- * vec - dead simple GPU-resident vector database
+ * vec-cpu - dead simple vector database (CPU mode, no GPU required)
  *
- * Usage:  vec <name> <dim[:format]> [port]
- *         format: f32 (default), f16
+ * Usage:  vec-cpu <name> <dim> [port]
  *
- * Creates an in-memory CUDA vector store.
+ * Creates an in-memory vector store. No CUDA dependency.
  * Listens on:
  *   - TCP port (default 1920)
  *   - Windows: Named pipe \\.\pipe\vec_<name>
@@ -37,12 +36,10 @@
  * Ctrl+C saves before exit.
  *
  * Build (Windows):
- *   nvcc -O2 -c vec_kernel.cu -o vec_kernel.obj <gencode flags>
- *   nvcc -O2 vec_kernel.obj vec.cpp -o vec.exe -lws2_32 <gencode flags>
+ *   cl /O2 /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib
  *
  * Build (Linux):
- *   nvcc -O2 -c vec_kernel.cu -o vec_kernel.o <gencode flags>
- *   nvcc -O2 vec_kernel.o vec.cpp -o vec -lpthread <gencode flags>
+ *   g++ -O2 vec-cpu.cpp -o vec-cpu -lpthread
  */
 
 /* ===================================================================== */
@@ -71,11 +68,11 @@
     #include <errno.h>
 #endif
 
-#include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 /* ===================================================================== */
 /*  Constants                                                            */
@@ -130,15 +127,26 @@ static void crc32_word(unsigned int crc, char *out) {
 }
 
 /* ===================================================================== */
-/*  External kernels (vec_kernel.cu)                                     */
+/*  CPU distance functions                                               */
 /* ===================================================================== */
 
-extern "C" {
-    void launch_l2_f32(const float *db, const float *query, float *dists, int n, int dim);
-    void launch_cos_f32(const float *db, const float *query, float *dists, int n, int dim);
-    void launch_l2_f16(const void *db, const void *query, float *dists, int n, int dim);
-    void launch_cos_f16(const void *db, const void *query, float *dists, int n, int dim);
-    void launch_f32_to_f16(const float *src, void *dst, int count);
+static void cpu_l2_f32(const float *db, const float *query, float *dists, int n, int dim) {
+    for (int i = 0; i < n; i++) {
+        const float *v = db + (size_t)i * dim;
+        float sum = 0.0f;
+        for (int d = 0; d < dim; d++) { float diff = v[d] - query[d]; sum += diff * diff; }
+        dists[i] = sum;
+    }
+}
+
+static void cpu_cos_f32(const float *db, const float *query, float *dists, int n, int dim) {
+    for (int i = 0; i < n; i++) {
+        const float *v = db + (size_t)i * dim;
+        float dot = 0, nv = 0, nq = 0;
+        for (int d = 0; d < dim; d++) { dot += v[d]*query[d]; nv += v[d]*v[d]; nq += query[d]*query[d]; }
+        float denom = sqrtf(nv) * sqrtf(nq);
+        dists[i] = (denom > 0) ? (1.0f - dot / denom) : 1.0f;
+    }
 }
 
 /* ===================================================================== */
@@ -159,9 +167,6 @@ static int g_capacity = 0;
 static void *d_vectors = NULL;
 static void *d_query = NULL;
 static float *d_dists = NULL;
-static float *d_staging = NULL;
-static int d_staging_n = 0;
-
 static float *h_dists = NULL;
 static int *h_ids = NULL;
 static float *h_pinned = NULL;
@@ -185,43 +190,26 @@ static volatile int g_running = 1;
 #endif
 
 /* ===================================================================== */
-/*  CUDA helpers                                                         */
+/*  Helpers                                                              */
 /* ===================================================================== */
 
-#define CUDA_CHECK(x) do { \
-    cudaError_t err = (x); \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while(0)
-
 /* ===================================================================== */
-/*  GPU memory management                                                */
+/*  Memory management                                                    */
 /* ===================================================================== */
-
-static void gpu_ensure_staging(int nfloats) {
-    if (nfloats <= d_staging_n) return;
-    if (d_staging) CUDA_CHECK(cudaFree(d_staging));
-    d_staging_n = nfloats;
-    CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
-}
 
 static void gpu_realloc_if_needed(int required) {
     if (required <= g_capacity) return;
     int new_cap = g_capacity;
     while (new_cap < required) new_cap *= 2;
 
-    void *d_new;
-    CUDA_CHECK(cudaMalloc(&d_new, (size_t)new_cap * g_dim * g_elem_size));
-    if (d_vectors && g_count > 0) {
-        CUDA_CHECK(cudaMemcpy(d_new, d_vectors, (size_t)g_count * g_dim * g_elem_size, cudaMemcpyDeviceToDevice));
-    }
-    if (d_vectors) CUDA_CHECK(cudaFree(d_vectors));
+    void *d_new = malloc((size_t)new_cap * g_dim * g_elem_size);
+    if (d_vectors && g_count > 0)
+        memcpy(d_new, d_vectors, (size_t)g_count * g_dim * g_elem_size);
+    free(d_vectors);
     d_vectors = d_new;
 
-    if (d_dists) CUDA_CHECK(cudaFree(d_dists));
-    CUDA_CHECK(cudaMalloc(&d_dists, new_cap * sizeof(float)));
+    free(d_dists);
+    d_dists = (float *)malloc(new_cap * sizeof(float));
 
     free(h_dists);
     free(h_ids);
@@ -243,14 +231,9 @@ static void gpu_realloc_if_needed(int required) {
 
 static void gpu_init() {
     g_capacity = INITIAL_CAP;
-    CUDA_CHECK(cudaMalloc(&d_vectors, (size_t)g_capacity * g_dim * g_elem_size));
-    CUDA_CHECK(cudaMalloc(&d_query, g_dim * g_elem_size));
-    CUDA_CHECK(cudaMalloc(&d_dists, g_capacity * sizeof(float)));
-
-    if (g_fmt == FMT_F16) {
-        d_staging_n = 1024 * g_dim;
-        CUDA_CHECK(cudaMalloc(&d_staging, d_staging_n * sizeof(float)));
-    }
+    d_vectors = malloc((size_t)g_capacity * g_dim * g_elem_size);
+    d_query = malloc(g_dim * g_elem_size);
+    d_dists = (float *)malloc(g_capacity * sizeof(float));
 
     h_dists = (float *)malloc(g_capacity * sizeof(float));
     h_ids = (int *)malloc(g_capacity * sizeof(int));
@@ -262,22 +245,21 @@ static void gpu_init() {
     g_labels_cap = g_capacity;
 
     h_pinned_n = 1024 * g_dim;
-    CUDA_CHECK(cudaMallocHost(&h_pinned, h_pinned_n * sizeof(float)));
+    h_pinned = (float *)malloc(h_pinned_n * sizeof(float));
 }
 
 static void gpu_ensure_pinned(int nfloats) {
     if (nfloats <= h_pinned_n) return;
-    CUDA_CHECK(cudaFreeHost(h_pinned));
+    free(h_pinned);
     h_pinned_n = nfloats;
-    CUDA_CHECK(cudaMallocHost(&h_pinned, h_pinned_n * sizeof(float)));
+    h_pinned = (float *)malloc(h_pinned_n * sizeof(float));
 }
 
 static void gpu_shutdown() {
-    if (d_vectors) cudaFree(d_vectors);
-    if (d_query) cudaFree(d_query);
-    if (d_dists) cudaFree(d_dists);
-    if (d_staging) cudaFree(d_staging);
-    if (h_pinned) cudaFreeHost(h_pinned);
+    free(d_vectors);
+    free(d_query);
+    free(d_dists);
+    free(h_pinned);
     free(h_dists);
     free(h_ids);
     free(g_alive);
@@ -292,14 +274,7 @@ static void gpu_shutdown() {
 /* ===================================================================== */
 
 static void upload_and_store(const float *h_data, void *d_dest, int nfloats) {
-    if (g_fmt == FMT_F32) {
-        CUDA_CHECK(cudaMemcpy(d_dest, h_data, nfloats * sizeof(float), cudaMemcpyHostToDevice));
-    } else {
-        gpu_ensure_staging(nfloats);
-        CUDA_CHECK(cudaMemcpy(d_staging, h_data, nfloats * sizeof(float), cudaMemcpyHostToDevice));
-        launch_f32_to_f16(d_staging, d_dest, nfloats);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+    memcpy(d_dest, h_data, nfloats * sizeof(float));
 }
 
 static void vec_set_label(int slot, const char *label, int len) {
@@ -361,19 +336,12 @@ static int vec_pull(const float *h_query, int *out_ids, float *out_dists, int mo
     int n = g_count;
     int k = (alive < TOP_K) ? alive : TOP_K;
 
-    cudaGetLastError();
-    upload_and_store(h_query, d_query, g_dim);
+    memcpy(d_query, h_query, g_dim * sizeof(float));
 
-    if (g_fmt == FMT_F32) {
-        if (mode == 1) launch_cos_f32((const float *)d_vectors, (const float *)d_query, d_dists, n, g_dim);
-        else launch_l2_f32((const float *)d_vectors, (const float *)d_query, d_dists, n, g_dim);
-    } else {
-        if (mode == 1) launch_cos_f16(d_vectors, d_query, d_dists, n, g_dim);
-        else launch_l2_f16(d_vectors, d_query, d_dists, n, g_dim);
-    }
+    if (mode == 1) cpu_cos_f32((const float *)d_vectors, (const float *)d_query, (float *)d_dists, n, g_dim);
+    else cpu_l2_f32((const float *)d_vectors, (const float *)d_query, (float *)d_dists, n, g_dim);
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_dists, d_dists, n * sizeof(float), cudaMemcpyDeviceToHost));
+    memcpy(h_dists, d_dists, n * sizeof(float));
 
     for (int i = 0; i < n; i++) {
         h_ids[i] = i;
@@ -417,11 +385,8 @@ static void save_to_file() {
         crc = crc32_update(crc, g_alive, g_count);
 
         size_t total_bytes = (size_t)g_count * g_dim * g_elem_size;
-        void *h_buf = malloc(total_bytes);
-        CUDA_CHECK(cudaMemcpy(h_buf, d_vectors, total_bytes, cudaMemcpyDeviceToHost));
-        fwrite(h_buf, 1, total_bytes, f);
-        crc = crc32_update(crc, h_buf, total_bytes);
-        free(h_buf);
+        fwrite(d_vectors, 1, total_bytes, f);
+        crc = crc32_update(crc, d_vectors, total_bytes);
     }
 
     fwrite(&crc, sizeof(unsigned int), 1, f);
@@ -517,7 +482,7 @@ static int load_from_file() {
             file_count = (int)(rd / (g_dim * g_elem_size));
         }
         crc = crc32_update(crc, h_buf, rd);
-        CUDA_CHECK(cudaMemcpy(d_vectors, h_buf, (size_t)file_count * g_dim * g_elem_size, cudaMemcpyHostToDevice));
+        memcpy(d_vectors, h_buf, (size_t)file_count * g_dim * g_elem_size);
         free(h_buf);
         g_count = file_count;
         g_deleted = file_deleted;
@@ -1739,21 +1704,23 @@ int main(int argc, char **argv) {
 
     int file_exists = peek_file_header();
 
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    double vram_gb = prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0);
-    double max_records = (prop.totalGlobalMem * 0.9) / ((double)g_dim * g_elem_size);
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    double total_ram_gb = ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+    double max_records = (ms.ullTotalPhys * 0.8) / ((double)g_dim * g_elem_size);
 
-    printf("%s (%.1f GB)\n", prop.name, vram_gb);
+    printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
+    if (total_ram_gb < 8.0)
+        fprintf(stderr, "WARN: only %.1f GB RAM available\n", total_ram_gb);
+
+    if (g_fmt == FMT_F16) {
+        fprintf(stderr, "ERROR: fp16 requires GPU. Use fp32 with vec-cpu.\n");
+        release_instance_lock();
+        return 1;
+    }
 
     gpu_init();
-    cudaGetLastError();
-
-    launch_l2_f32((const float *)d_vectors, (const float *)d_query, d_dists, 1, g_dim);
-    cudaDeviceSynchronize();
-    cudaGetLastError();
 
     int lr = load_from_file();
     if (lr < 0) {
@@ -2190,21 +2157,22 @@ int main(int argc, char **argv) {
 
     int file_exists = peek_file_header();
 
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    double vram_gb = prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0);
-    double max_records = (prop.totalGlobalMem * 0.9) / ((double)g_dim * g_elem_size);
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    double total_ram_gb = (double)pages * page_size / (1024.0 * 1024.0 * 1024.0);
+    double max_records = (total_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.8) / ((double)g_dim * g_elem_size);
 
-    printf("%s (%.1f GB)\n", prop.name, vram_gb);
+    printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
+    if (total_ram_gb < 8.0)
+        fprintf(stderr, "WARN: only %.1f GB RAM available\n", total_ram_gb);
+
+    if (g_fmt == FMT_F16) {
+        fprintf(stderr, "ERROR: fp16 requires GPU. Use fp32 with vec-cpu.\n");
+        release_instance_lock();
+        return 1;
+    }
 
     gpu_init();
-    cudaGetLastError();
-
-    launch_l2_f32((const float *)d_vectors, (const float *)d_query, d_dists, 1, g_dim);
-    cudaDeviceSynchronize();
-    cudaGetLastError();
 
     int lr = load_from_file();
     if (lr < 0) {

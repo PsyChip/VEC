@@ -1,10 +1,10 @@
 # VEC SDK
 
-Client libraries and protocol documentation for VEC - GPU-resident vector database.
+Client libraries and protocol documentation for VEC. SDKs work identically with both `vec` (GPU) and `vec-cpu` (CPU) servers.
 
 ## Protocol
 
-VEC uses a text-based TCP protocol. One command per line (`\n` terminated), one response per line.
+TCP text protocol. One command per line (`\n` terminated), one response per line.
 
 ### Connection
 
@@ -17,20 +17,20 @@ VEC uses a text-based TCP protocol. One command per line (`\n` terminated), one 
 | Command | Format | Response |
 |---------|--------|----------|
 | push | `push [label] <floats>\n` | `<slot_index>\n` |
-| bpush | `bpush [label]\n<raw bytes>` | `<slot_index>\n` |
-| pull | `pull <floats>\n` | `<results>\n` |
-| cpull | `cpull <floats>\n` | `<results>\n` |
-| bpull | `bpull\n<raw bytes>` | `<results>\n` |
-| bcpull | `bcpull\n<raw bytes>` | `<results>\n` |
+| bpush | `bpush [label]\n<dim*4 bytes>` | `<slot_index>\n` |
+| pull | `pull <floats>\n` | `<label:dist,...>\n` |
+| cpull | `cpull <floats>\n` | `<label:dist,...>\n` |
+| bpull | `bpull\n<dim*4 bytes>` | `<label:dist,...>\n` |
+| bcpull | `bcpull\n<dim*4 bytes>` | `<label:dist,...>\n` |
 | label | `label <index> <string>\n` | `ok\n` |
 | delete | `delete <index>\n` | `ok\n` |
 | undo | `undo\n` | `ok\n` |
 | save | `save\n` | `ok\n` |
 | size | `size\n` | `<count>\n` |
 
-### push
+### Push
 
-Send a vector as comma-separated fp32 floats with optional label. Dimension must match server.
+Send a vector as comma-separated fp32 floats with optional label. Use quotes for labels with spaces.
 
 ```
 -> push 0.123,0.456,0.789\n
@@ -38,59 +38,61 @@ Send a vector as comma-separated fp32 floats with optional label. Dimension must
 
 -> push docs/report.pdf?page=2 0.123,0.456,0.789\n
 <- 43\n
+
+-> push "user: hello world" 0.123,0.456,0.789\n
+<- 44\n
 ```
 
-### bpush (binary push)
+### Binary push
 
-Send a single vector as raw fp32 binary data with optional label. Faster than text push.
+Send a single vector as raw fp32 binary data with optional label.
 
 ```
 -> bpush\n
--> <dim * 4 bytes of raw little-endian fp32 data>
+-> <dim * 4 bytes little-endian fp32>
 <- 42\n
 
--> bpush docs/report.pdf?page=2\n
--> <dim * 4 bytes of raw little-endian fp32 data>
+-> bpush "quoted label"\n
+-> <dim * 4 bytes little-endian fp32>
 <- 43\n
 ```
 
-### pull / cpull (text query)
+### Query (pull / cpull)
 
-Query nearest neighbors. `pull` uses L2 distance, `cpull` uses cosine distance.
+`pull` = L2 distance, `cpull` = cosine distance.
 
 ```
 -> pull 0.123,0.456,0.789\n
-<- docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100,12:0.234000\n
+<- docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100,42:0.234000\n
 ```
 
-Results are `label:distance` or `index:distance` pairs, comma-separated, nearest first. Up to 10 results. Labels must not contain colons or commas.
+Results: `label:distance` or `index:distance` pairs. Comma-separated, nearest first. Up to 10 results. Parse each result by splitting on the last colon.
 
-### bpull / bcpull (binary query)
+### Binary query (bpull / bcpull)
 
-Same as pull/cpull but query vector is sent as raw fp32 bytes instead of text.
+Same as pull/cpull but query vector sent as raw fp32 bytes.
 
 ```
 -> bpull\n
--> <dim * 4 bytes of raw little-endian fp32 data>
-<- docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100\n
+-> <dim * 4 bytes little-endian fp32>
+<- docs/report.pdf?page=2:0.001234,44:0.234000\n
 ```
 
 `bcpull` uses cosine distance.
 
-### label
+### Label
 
-Set or override a label for an existing slot.
+Set or override label for an existing slot. Quotes supported.
 
 ```
 -> label 42 docs/report.pdf?page=2\n
 <- ok\n
+
+-> label 42 "label with spaces"\n
+<- ok\n
 ```
 
-Labels must not contain colons or commas (they will be stripped with a warning).
-
 ### Errors
-
-All errors start with `err`:
 
 ```
 err dim mismatch: got 3, expected 1024
@@ -100,55 +102,45 @@ err empty
 err unknown command
 ```
 
-## File Format
+## File format
 
-### .tensors (vector data)
-
-Binary file, little-endian:
+### .tensors
 
 ```
-Offset  Size              Description
-0       4 bytes (int32)   dimension
-4       4 bytes (int32)   total vector count
-8       4 bytes (int32)   deleted count
-12      1 byte (uint8)    format (0=fp32, 1=fp16)
-13      count bytes       alive mask (1=active, 0=deleted)
-13+N    count*dim*elem    vector data (elem=4 for fp32, 2 for fp16)
-EOF-4   4 bytes (uint32)  CRC32 checksum
+[4B dim][4B count][4B deleted][1B format][count B alive mask][vector data][4B CRC32]
 ```
 
-### .meta (label data)
+Naming: `<name>_<dim>_<format>.tensors`
 
-Companion file, created only when labels exist:
+### .meta (labels, only created when labels exist)
 
 ```
-Offset  Size              Description
-0       4 bytes (int32)   label count
-        per label:
-          4 bytes (int32) string length (0 = no label)
-          N bytes         string data (if length > 0)
+[4B count][per label: 4B length + string bytes]
 ```
 
-File naming: `<name>_<dim>_<format>.tensors` + `<name>_<dim>_<format>.meta`
+## Client libraries
 
-## Client Libraries
-
-- `vec_client.py` - Python
-- `vec_client.js` - Node.js
 - `vec_client.h` - C++
+- `vec_client.py` - Python (requires numpy)
+- `vec_client.js` - Node.js
 - `vec_client.pas` - Delphi
 
-All clients implement:
-- `connect(host, port)`
-- `push(vector, [label]) -> int`
-- `bpush(vector, [label]) -> int`
-- `pull(vector) -> results`
-- `cpull(vector) -> results`
-- `bpull(vector) -> results`
-- `bcpull(vector) -> results`
-- `setLabel(index, label)`
-- `delete(index)`
-- `undo()`
-- `save()`
-- `size() -> int`
-- `close()`
+All implement:
+
+```
+connect(host, port)
+push(vector, [label]) -> int
+bpush(vector, [label]) -> int
+pull(vector) -> results
+cpull(vector) -> results
+bpull(vector) -> results
+bcpull(vector) -> results
+setLabel(index, label)
+delete(index)
+undo()
+save()
+size() -> int
+close()
+```
+
+Results contain `index`, `distance`, and `label` fields. When a label is present, `index` is -1 and `label` contains the string. When no label, `index` is the numeric slot ID.

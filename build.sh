@@ -9,5 +9,8 @@ nvcc -O2 -c vec_kernel.cu -o vec_kernel.o \
 echo "[build] linking vec..."
 nvcc -O2 vec_kernel.o vec.cpp -o vec -lpthread || exit 1
 
+echo "[build] compiling vec-cpu..."
+g++ -O2 vec-cpu.cpp -o vec-cpu -lpthread || exit 1
+
 echo "[build] done."
 rm -f vec_kernel.o
