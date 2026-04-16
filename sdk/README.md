@@ -144,3 +144,25 @@ close()
 ```
 
 Results contain `index`, `distance`, and `label` fields. When a label is present, `index` is -1 and `label` contains the string. When no label, `index` is the numeric slot ID.
+
+## Router mode
+
+All SDKs support an optional namespace for use with `vec --route`. Set it once after connecting — all commands are automatically prefixed with `command namespace args`.
+
+```python
+# Python
+vec = VecClient("localhost", 1920, namespace="tools")
+
+# Node.js
+const vec = new VecClient('localhost', 1920, 'tools');
+
+# C++
+VecClient vec;
+vec.connect_tcp("localhost", 1920);
+vec.setNamespace("tools");
+
+# Delphi
+Vec := TVecClient.Create;
+Vec.ConnectTCP('localhost', 1920);
+Vec.Namespace := 'tools';
+```

@@ -37,9 +37,9 @@ Not supported: GTX 1000 series (Pascal) and older. AMD and Intel GPUs are not su
 
 | Vectors | GPU (RTX 3060) | CPU |
 |---|---|---|
-| 10K | ~0.2 ms | ~3 ms |
-| 100K | ~1.5 ms | ~30 ms |
-| 1M | ~14 ms | ~300 ms |
+| 10K | ~0.2 ms | ~2 ms |
+| 100K | ~1.5 ms | ~20 ms |
+| 1M | ~14 ms | ~200 ms |
 
 ---
 
@@ -77,7 +77,7 @@ vec --notcp conversations 1024
 vec --route 1920
 ```
 
-Client sends namespace-prefixed commands: `tools push 0.12,...\n`
+Client sends commands with namespace: `push tools 0.12,...\n`
 
 ---
 
@@ -170,9 +170,11 @@ vec-cpu mydb 1024
 
 | Records | Latency |
 |---|---|
-| 10K | ~3 ms |
-| 100K | ~30 ms |
-| 1M | ~300 ms |
+| 10K | ~2 ms |
+| 100K | ~20 ms |
+| 1M | ~200 ms |
+
+Built with AVX2 auto-vectorization and fast-math on Windows (`/arch:AVX2 /fp:fast`), native SIMD on Linux (`-O3 -march=native -ffast-math`).
 
 ### Requirements
 
@@ -197,7 +199,7 @@ On startup, checks available RAM. Warns if less than 8 GB.
 build.bat
 ```
 
-Builds: `vec.exe`, `vec-cpu.exe`, `test.exe`, `test_route.exe`
+Builds: `vec.exe`, `vec-cpu.exe`, `test.exe`
 
 ### Linux
 
@@ -215,11 +217,10 @@ nvcc -O2 -c vec_kernel.cu -o vec_kernel.obj <gencode flags>
 nvcc -O2 vec_kernel.obj vec.cpp -o vec.exe -lws2_32 -lmpr <gencode flags>
 
 :: vec-cpu (CPU)
-cl /O2 /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib
+cl /O2 /arch:AVX2 /fp:fast /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib
 
 :: test
 cl /O2 /EHsc test.cpp /Fe:test.exe ws2_32.lib
-cl /O2 /EHsc test_route.cpp /Fe:test_route.exe ws2_32.lib
 ```
 
 ### Test
@@ -228,15 +229,6 @@ cl /O2 /EHsc test_route.cpp /Fe:test_route.exe ws2_32.lib
 :: single instance test
 vec mydb 1024
 test mydb 1024
-
-:: router test (5 namespaces)
-start vec --notcp tools 3
-start vec --notcp conversations 3
-start vec --notcp faces 3
-start vec --notcp clips 3
-start vec --notcp notes 3
-start vec --route 1920
-test_route 1920
 ```
 
 ---

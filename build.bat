@@ -8,7 +8,7 @@ nvcc -O2 vec_kernel.obj vec.cpp -o vec.exe -lws2_32 -lmpr -Wno-deprecated-gpu-ta
 if %errorlevel% neq 0 goto fail
 
 echo [build] compiling vec-cpu.exe...
-cl /O2 /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib /nologo
+cl /O2 /arch:AVX2 /fp:fast /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib /nologo
 if %errorlevel% neq 0 goto fail
 
 echo [build] compiling test.exe...

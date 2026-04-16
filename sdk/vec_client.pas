@@ -3,11 +3,18 @@
 
   Usage:
     var Vec: TVecClient;
-    Vec := TVecClient.Create('localhost', 1920);
+    Vec := TVecClient.Create;
+    Vec.ConnectTCP('localhost', 1920);
     idx := Vec.Push(myVector);
     idx := Vec.PushLabeled('docs/file.pdf?page=2', myVector);
     results := Vec.Pull(queryVector);
     Vec.Free;
+
+  Router mode:
+    Vec := TVecClient.Create;
+    Vec.ConnectTCP('localhost', 1920);
+    Vec.Namespace := 'tools';
+    idx := Vec.Push(myVector);  // sends: push tools 0.1,...
 
   Works with both TCP (all platforms) and Named Pipes (Windows only).
 }
@@ -34,6 +41,8 @@ type
     FConnected: Boolean;
     FUsePipe: Boolean;
     FPipeHandle: THandle;
+    FNamespace: string;
+    function NsPrefix: string;
     function ReadLine: string;
     procedure SendStr(const S: string);
     procedure SendBytes(const Data: Pointer; Len: Integer);
@@ -60,6 +69,7 @@ type
     procedure Close;
     destructor Destroy; override;
     property Connected: Boolean read FConnected;
+    property Namespace: string read FNamespace write FNamespace;
   end;
 
 implementation
@@ -71,6 +81,15 @@ begin
   FConnected := False;
   FUsePipe := False;
   FPipeHandle := INVALID_HANDLE_VALUE;
+  FNamespace := '';
+end;
+
+function TVecClient.NsPrefix: string;
+begin
+  if FNamespace <> '' then
+    Result := FNamespace + ' '
+  else
+    Result := '';
 end;
 
 function TVecClient.ConnectTCP(const Host: string; Port: Integer): Boolean;
@@ -230,7 +249,7 @@ function TVecClient.Push(const Vec: TSingleArray): Integer;
 var
   Resp: string;
 begin
-  SendStr('push ' + VecToCSV(Vec) + #10);
+  SendStr('push ' + NsPrefix + VecToCSV(Vec) + #10);
   Resp := ReadLine;
   CheckError(Resp);
   Result := StrToInt(Resp);
@@ -240,7 +259,7 @@ function TVecClient.PushLabeled(const ALabel: string; const Vec: TSingleArray): 
 var
   Resp: string;
 begin
-  SendStr('push ' + ALabel + ' ' + VecToCSV(Vec) + #10);
+  SendStr('push ' + NsPrefix + ALabel + ' ' + VecToCSV(Vec) + #10);
   Resp := ReadLine;
   CheckError(Resp);
   Result := StrToInt(Resp);
@@ -250,7 +269,7 @@ function TVecClient.BPush(const Vec: TSingleArray): Integer;
 var
   Resp: string;
 begin
-  SendStr('bpush' + #10);
+  SendStr('bpush ' + NsPrefix + #10);
   SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
   Resp := ReadLine;
   CheckError(Resp);
@@ -261,7 +280,7 @@ function TVecClient.BPushLabeled(const ALabel: string; const Vec: TSingleArray):
 var
   Resp: string;
 begin
-  SendStr('bpush ' + ALabel + #10);
+  SendStr('bpush ' + NsPrefix + ALabel + #10);
   SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
   Resp := ReadLine;
   CheckError(Resp);
@@ -270,57 +289,57 @@ end;
 
 function TVecClient.Pull(const Vec: TSingleArray): TVecResults;
 begin
-  SendStr('pull ' + VecToCSV(Vec) + #10);
+  SendStr('pull ' + NsPrefix + VecToCSV(Vec) + #10);
   Result := ParseResults(ReadLine);
 end;
 
 function TVecClient.CPull(const Vec: TSingleArray): TVecResults;
 begin
-  SendStr('cpull ' + VecToCSV(Vec) + #10);
+  SendStr('cpull ' + NsPrefix + VecToCSV(Vec) + #10);
   Result := ParseResults(ReadLine);
 end;
 
 function TVecClient.BPull(const Vec: TSingleArray): TVecResults;
 begin
-  SendStr('bpull' + #10);
+  SendStr('bpull ' + NsPrefix + #10);
   SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
   Result := ParseResults(ReadLine);
 end;
 
 function TVecClient.BCPull(const Vec: TSingleArray): TVecResults;
 begin
-  SendStr('bcpull' + #10);
+  SendStr('bcpull ' + NsPrefix + #10);
   SendBytes(@Vec[0], Length(Vec) * SizeOf(Single));
   Result := ParseResults(ReadLine);
 end;
 
 procedure TVecClient.SetLabel(Index: Integer; const ALabel: string);
 begin
-  SendStr('label ' + IntToStr(Index) + ' ' + ALabel + #10);
+  SendStr('label ' + NsPrefix + IntToStr(Index) + ' ' + ALabel + #10);
   CheckError(ReadLine);
 end;
 
 procedure TVecClient.Delete(Index: Integer);
 begin
-  SendStr('delete ' + IntToStr(Index) + #10);
+  SendStr('delete ' + NsPrefix + IntToStr(Index) + #10);
   CheckError(ReadLine);
 end;
 
 procedure TVecClient.Undo;
 begin
-  SendStr('undo' + #10);
+  SendStr('undo ' + NsPrefix + #10);
   CheckError(ReadLine);
 end;
 
 procedure TVecClient.Save;
 begin
-  SendStr('save' + #10);
+  SendStr('save ' + NsPrefix + #10);
   CheckError(ReadLine);
 end;
 
 function TVecClient.Size: Integer;
 begin
-  SendStr('size' + #10);
+  SendStr('size ' + NsPrefix + #10);
   Result := StrToInt(ReadLine);
 end;
 

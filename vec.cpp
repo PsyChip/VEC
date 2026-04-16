@@ -1005,7 +1005,7 @@ static void print_help() {
     printf("  vec --notcp tools 1024\n");
     printf("  vec --notcp conversations 1024\n");
     printf("  vec --route 1920\n");
-    printf("  client sends: tools push 0.12,...\\n\n");
+    printf("  client sends: push tools 0.12,...\\n\n");
 }
 
 /* ===================================================================== */
@@ -1090,18 +1090,23 @@ static DWORD WINAPI router_client_thread(LPVOID param) {
             char *nl = (char *)memchr(buf, '\n', buf_used);
             if (!nl) break;
             int line_len = (int)(nl - buf);
-            const char *ns_start = buf;
+            /* parse: command namespace [args...] */
+            int cmd_len = 0;
+            while (cmd_len < line_len && buf[cmd_len] != ' ') cmd_len++;
+            const char *ns_start = buf + cmd_len + 1;
             int ns_len = 0;
-            while (ns_len < line_len && buf[ns_len] != ' ') ns_len++;
+            while (cmd_len + 1 + ns_len < line_len && ns_start[ns_len] != ' ') ns_len++;
             route_entry *route = NULL;
-            for (int i = 0; i < g_route_count; i++) {
-                if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
-            }
-            if (!route) {
-                int old_count = g_route_count;
-                router_discover_pipes();
-                for (int i = old_count; i < g_route_count; i++) {
+            if (ns_len > 0) {
+                for (int i = 0; i < g_route_count; i++) {
                     if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                }
+                if (!route) {
+                    int old_count = g_route_count;
+                    router_discover_pipes();
+                    for (int i = old_count; i < g_route_count; i++) {
+                        if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                    }
                 }
             }
             char resp[65536];
@@ -1109,12 +1114,18 @@ static DWORD WINAPI router_client_thread(LPVOID param) {
                 int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
                 send(client, resp, rlen, 0);
             } else {
-                const char *cmd = buf + ns_len + 1;
-                int cmd_len = line_len - ns_len;
+                /* rebuild as: command [args...]\n (strip namespace) */
                 char fwd[65536];
-                memcpy(fwd, cmd, cmd_len);
-                fwd[cmd_len] = '\n';
-                int rlen = router_send_recv(route, fwd, cmd_len + 1, resp, sizeof(resp));
+                int fwd_len = 0;
+                memcpy(fwd, buf, cmd_len);
+                fwd_len = cmd_len;
+                int rest_off = cmd_len + 1 + ns_len;
+                if (rest_off < line_len) {
+                    memcpy(fwd + fwd_len, buf + rest_off, line_len - rest_off);
+                    fwd_len += line_len - rest_off;
+                }
+                fwd[fwd_len] = '\n';
+                int rlen = router_send_recv(route, fwd, fwd_len + 1, resp, sizeof(resp));
                 if (rlen > 0) send(client, resp, rlen, 0);
                 else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
             }
@@ -1224,18 +1235,23 @@ static void *router_client_thread(void *param) {
             char *nl = (char *)memchr(buf, '\n', buf_used);
             if (!nl) break;
             int line_len = (int)(nl - buf);
-            const char *ns_start = buf;
+            /* parse: command namespace [args...] */
+            int cmd_len = 0;
+            while (cmd_len < line_len && buf[cmd_len] != ' ') cmd_len++;
+            const char *ns_start = buf + cmd_len + 1;
             int ns_len = 0;
-            while (ns_len < line_len && buf[ns_len] != ' ') ns_len++;
+            while (cmd_len + 1 + ns_len < line_len && ns_start[ns_len] != ' ') ns_len++;
             route_entry *route = NULL;
-            for (int i = 0; i < g_route_count; i++) {
-                if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
-            }
-            if (!route) {
-                int old_count = g_route_count;
-                router_discover_sockets();
-                for (int i = old_count; i < g_route_count; i++) {
+            if (ns_len > 0) {
+                for (int i = 0; i < g_route_count; i++) {
                     if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                }
+                if (!route) {
+                    int old_count = g_route_count;
+                    router_discover_sockets();
+                    for (int i = old_count; i < g_route_count; i++) {
+                        if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                    }
                 }
             }
             char resp[65536];
@@ -1243,12 +1259,18 @@ static void *router_client_thread(void *param) {
                 int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
                 send(client, resp, rlen, 0);
             } else {
-                const char *cmd = buf + ns_len + 1;
-                int cmd_len = line_len - ns_len;
+                /* rebuild as: command [args...]\n (strip namespace) */
                 char fwd[65536];
-                memcpy(fwd, cmd, cmd_len);
-                fwd[cmd_len] = '\n';
-                int rlen = router_send_recv(route, fwd, cmd_len + 1, resp, sizeof(resp));
+                int fwd_len = 0;
+                memcpy(fwd, buf, cmd_len);
+                fwd_len = cmd_len;
+                int rest_off = cmd_len + 1 + ns_len;
+                if (rest_off < line_len) {
+                    memcpy(fwd + fwd_len, buf + rest_off, line_len - rest_off);
+                    fwd_len += line_len - rest_off;
+                }
+                fwd[fwd_len] = '\n';
+                int rlen = router_send_recv(route, fwd, fwd_len + 1, resp, sizeof(resp));
                 if (rlen > 0) send(client, resp, rlen, 0);
                 else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
             }

@@ -2,12 +2,19 @@
  * VEC C++ Client SDK
  *
  * Usage:
- *   VecClient vec("localhost", 1920);
+ *   VecClient vec;
+ *   vec.connect_tcp("localhost", 1920);
  *   int idx = vec.push(vector, 1024);
  *   int idx = vec.push("docs/file.pdf?page=2", vector, 1024);
  *   VecResult results[10];
  *   int n = vec.pull(vector, 1024, results, 10);
  *   vec.close();
+ *
+ * Router mode:
+ *   VecClient vec;
+ *   vec.connect_tcp("localhost", 1920);
+ *   vec.setNamespace("tools");
+ *   int idx = vec.push(vector, 1024);  // sends: push tools 0.1,...
  *
  * Build: link with ws2_32.lib (Windows) or nothing extra (Linux)
  */
@@ -48,6 +55,7 @@ struct VecResult {
 class VecClient {
     vec_sock_t sock;
     char rbuf[65536];
+    char ns_prefix[128]; /* "namespace " or "" */
 
     int readline(char *buf, int maxlen) {
         int total = 0;
@@ -74,7 +82,7 @@ class VecClient {
 
     void fmt_vec(char *cmd, const char *prefix, const float *vec, int dim) {
         char *p = cmd;
-        p += sprintf(p, "%s ", prefix);
+        p += sprintf(p, "%s %s", prefix, ns_prefix);
         for (int i = 0; i < dim; i++) {
             if (i > 0) *p++ = ',';
             p += sprintf(p, "%.6f", vec[i]);
@@ -83,7 +91,12 @@ class VecClient {
     }
 
 public:
-    VecClient() : sock(VEC_INVALID_SOCK) {}
+    VecClient() : sock(VEC_INVALID_SOCK) { ns_prefix[0] = '\0'; }
+
+    void setNamespace(const char *ns) {
+        if (ns && ns[0]) snprintf(ns_prefix, sizeof(ns_prefix), "%s ", ns);
+        else ns_prefix[0] = '\0';
+    }
 
     int connect_tcp(const char *host, int port) {
 #ifdef _WIN32
@@ -139,7 +152,7 @@ public:
     int push(const char *label, const float *vec, int dim) {
         char cmd[65536];
         char *p = cmd;
-        p += sprintf(p, "push %s ", label);
+        p += sprintf(p, "push %s%s ", ns_prefix, label);
         for (int i = 0; i < dim; i++) {
             if (i > 0) *p++ = ',';
             p += sprintf(p, "%.6f", vec[i]);
@@ -152,7 +165,9 @@ public:
     }
 
     int bpush(const float *vec, int dim) {
-        send_all("bpush\n", 6);
+        char header[1024];
+        int hlen = sprintf(header, "bpush %s\n", ns_prefix);
+        send_all(header, hlen);
         send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
         if (strncmp(rbuf, "err", 3) == 0) return -1;
@@ -161,7 +176,7 @@ public:
 
     int bpush(const char *label, const float *vec, int dim) {
         char header[1024];
-        int hlen = sprintf(header, "bpush %s\n", label);
+        int hlen = sprintf(header, "bpush %s%s\n", ns_prefix, label);
         send_all(header, hlen);
         send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
@@ -186,14 +201,18 @@ public:
     }
 
     int bpull(const float *vec, int dim, VecResult *results, int max_results) {
-        send_all("bpull\n", 6);
+        char header[1024];
+        int hlen = sprintf(header, "bpull %s\n", ns_prefix);
+        send_all(header, hlen);
         send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
         return parse_results(rbuf, results, max_results);
     }
 
     int bcpull(const float *vec, int dim, VecResult *results, int max_results) {
-        send_all("bcpull\n", 7);
+        char header[1024];
+        int hlen = sprintf(header, "bcpull %s\n", ns_prefix);
+        send_all(header, hlen);
         send_all((const char *)vec, dim * (int)sizeof(float));
         readline(rbuf, sizeof(rbuf));
         return parse_results(rbuf, results, max_results);
@@ -201,34 +220,40 @@ public:
 
     int setLabel(int index, const char *label) {
         char cmd[1024];
-        int len = sprintf(cmd, "label %d %s\n", index, label);
+        int len = sprintf(cmd, "label %s%d %s\n", ns_prefix, index, label);
         send_all(cmd, len);
         readline(rbuf, sizeof(rbuf));
         return (strncmp(rbuf, "err", 3) == 0) ? -1 : 0;
     }
 
     int vec_delete(int index) {
-        char cmd[64];
-        int len = sprintf(cmd, "delete %d\n", index);
+        char cmd[256];
+        int len = sprintf(cmd, "delete %s%d\n", ns_prefix, index);
         send_all(cmd, len);
         readline(rbuf, sizeof(rbuf));
         return (strncmp(rbuf, "err", 3) == 0) ? -1 : 0;
     }
 
     int undo() {
-        send_all("undo\n", 5);
+        char cmd[256];
+        int len = sprintf(cmd, "undo %s\n", ns_prefix);
+        send_all(cmd, len);
         readline(rbuf, sizeof(rbuf));
         return (strncmp(rbuf, "err", 3) == 0) ? -1 : 0;
     }
 
     int save() {
-        send_all("save\n", 5);
+        char cmd[256];
+        int len = sprintf(cmd, "save %s\n", ns_prefix);
+        send_all(cmd, len);
         readline(rbuf, sizeof(rbuf));
         return (strncmp(rbuf, "err", 3) == 0) ? -1 : 0;
     }
 
     int size() {
-        send_all("size\n", 5);
+        char cmd[256];
+        int len = sprintf(cmd, "size %s\n", ns_prefix);
+        send_all(cmd, len);
         readline(rbuf, sizeof(rbuf));
         return atoi(rbuf);
     }

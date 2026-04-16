@@ -9,16 +9,21 @@
  *   const idx = await vec.push([0.1, 0.2, 0.3], 'docs/file.pdf?page=2');
  *   const results = await vec.pull([0.1, 0.2, 0.3]);
  *   vec.close();
+ *
+ * Router mode:
+ *   const vec = new VecClient('localhost', 1920, 'tools');
+ *   const idx = await vec.push([0.1, 0.2, 0.3]);  // sends: push tools 0.1,...
  */
 const net = require('net');
 
 class VecClient {
-    constructor(host = 'localhost', port = 1920) {
+    constructor(host = 'localhost', port = 1920, namespace = null) {
         this.host = host;
         this.port = port;
         this.sock = null;
         this.buffer = '';
         this.pending = [];
+        this._ns = namespace ? `${namespace} ` : '';
     }
 
     connect() {
@@ -62,7 +67,7 @@ class VecClient {
 
     async push(vector, label = null) {
         const csv = vector.map(v => v.toFixed(6)).join(',');
-        const cmd = label ? `push ${label} ${csv}\n` : `push ${csv}\n`;
+        const cmd = label ? `push ${this._ns}${label} ${csv}\n` : `push ${this._ns}${csv}\n`;
         const resp = await this._command(cmd);
         return parseInt(resp);
     }
@@ -71,20 +76,20 @@ class VecClient {
         const dim = vector.length;
         const buf = Buffer.alloc(dim * 4);
         for (let i = 0; i < dim; i++) buf.writeFloatLE(vector[i], i * 4);
-        const header = label ? `bpush ${label}\n` : 'bpush\n';
+        const header = label ? `bpush ${this._ns}${label}\n` : `bpush ${this._ns}\n`;
         const resp = await this._commandBin(header, buf);
         return parseInt(resp);
     }
 
     async pull(vector) {
         const csv = vector.map(v => v.toFixed(6)).join(',');
-        const resp = await this._command(`pull ${csv}\n`);
+        const resp = await this._command(`pull ${this._ns}${csv}\n`);
         return this._parseResults(resp);
     }
 
     async cpull(vector) {
         const csv = vector.map(v => v.toFixed(6)).join(',');
-        const resp = await this._command(`cpull ${csv}\n`);
+        const resp = await this._command(`cpull ${this._ns}${csv}\n`);
         return this._parseResults(resp);
     }
 
@@ -92,7 +97,7 @@ class VecClient {
         const dim = vector.length;
         const buf = Buffer.alloc(dim * 4);
         for (let i = 0; i < dim; i++) buf.writeFloatLE(vector[i], i * 4);
-        const resp = await this._commandBin('bpull\n', buf);
+        const resp = await this._commandBin(`bpull ${this._ns}\n`, buf);
         return this._parseResults(resp);
     }
 
@@ -100,28 +105,28 @@ class VecClient {
         const dim = vector.length;
         const buf = Buffer.alloc(dim * 4);
         for (let i = 0; i < dim; i++) buf.writeFloatLE(vector[i], i * 4);
-        const resp = await this._commandBin('bcpull\n', buf);
+        const resp = await this._commandBin(`bcpull ${this._ns}\n`, buf);
         return this._parseResults(resp);
     }
 
     async setLabel(index, label) {
-        await this._command(`label ${index} ${label}\n`);
+        await this._command(`label ${this._ns}${index} ${label}\n`);
     }
 
     async delete(index) {
-        await this._command(`delete ${index}\n`);
+        await this._command(`delete ${this._ns}${index}\n`);
     }
 
     async undo() {
-        await this._command('undo\n');
+        await this._command(`undo ${this._ns}\n`);
     }
 
     async save() {
-        await this._command('save\n');
+        await this._command(`save ${this._ns}\n`);
     }
 
     async size() {
-        const resp = await this._command('size\n');
+        const resp = await this._command(`size ${this._ns}\n`);
         return parseInt(resp);
     }
 

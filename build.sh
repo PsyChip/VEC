@@ -10,7 +10,7 @@ echo "[build] linking vec..."
 nvcc -O2 vec_kernel.o vec.cpp -o vec -lpthread || exit 1
 
 echo "[build] compiling vec-cpu..."
-g++ -O2 vec-cpu.cpp -o vec-cpu -lpthread || exit 1
+g++ -O3 -march=native -ffast-math vec-cpu.cpp -o vec-cpu -lpthread || exit 1
 
 echo "[build] done."
 rm -f vec_kernel.o
