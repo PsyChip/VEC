@@ -6,6 +6,8 @@
  * vec-cpu - dead simple vector database (CPU mode, no GPU required)
  *
  * Usage:  vec-cpu <name> <dim> [port]
+ *         vec-cpu deploy [port]
+ *         vec-cpu --deploy=name:dim[,...] [port]
  *
  * Creates an in-memory vector store. No CUDA dependency.
  * Listens on:
@@ -13,25 +15,26 @@
  *   - Windows: Named pipe \\.\pipe\vec_<name>
  *   - Linux:   Unix socket /tmp/vec_<name>.sock
  *
- * Protocol (TCP & pipe/socket):
- *   push [label] 0.1,0.2,...\n    -> slot index (text push, optional label)
- *   bpush [label]\n<dim*4 bytes>  -> slot index (binary push, optional label)
- *   pull 0.1,0.2,...\n            -> results (L2 text query)
- *   cpull 0.1,0.2,...\n           -> results (cosine text query)
- *   bpull\n<dim*4 bytes>          -> results (L2 binary query)
- *   bcpull\n<dim*4 bytes>         -> results (cosine binary query)
- *   label <index> <string>\n      -> ok (set/override label)
- *   delete <index>\n              -> ok (tombstone)
- *   undo\n                        -> ok (remove last)
- *   save\n                        -> ok (flush to disk)
- *   size\n                        -> total count
+ * VEC 2.0 binary frame protocol — see PROTOCOL-2.0.md for the byte-exact spec.
+ *   request:  F0 <2B ns_len> [ns] <CMD> <2B label_len> [label] <4B body_len> [body]
+ *   response: <1B status> <4B body_len> [body]   ; status 0=OK, 1=ERR
+ *   CMD: 01=push 02=query 04=get 06=update 07=delete 08=label
+ *        09=undo 0A=save 0D=cluster 0E=distinct 0F=represent
+ *        10=info 11=qid 13=set_data 14=get_data
  *
- * Results format: label:distance or index:distance, comma-separated
- * Labels must not contain colons. Use URI-style paths without scheme prefix.
- * Labels saved to .meta sidecar file alongside .tensors
+ * Labels: filename-scheme, ≤2048 bytes, validated on write, lenient on load.
+ * Data:   opaque blobs ≤100KB, requires a label.
+ * DISTINCT and REPRESENT return "not available in cpu mode".
  *
- * File format (.tensors):
- *   [4B dim][4B count][4B deleted][1B format][count B alive mask][vector data]
+ * File format:
+ *   .tensors  [4B dim][4B count][4B deleted][1B fmt][count B alive][vectors][4B CRC32]
+ *   .meta     [4B count][per slot: 4B len + label bytes]
+ *   .data     [4B count][count B alive mask][per present slot: 4B len + bytes][4B CRC32]
+ *
+ * Features:
+ *   - Read-only mode if file is not writable
+ *   - Disk space check before save
+ *   - File integrity check/repair (--check, --repair)
  *
  * Ctrl+C saves before exit.
  *
@@ -57,6 +60,8 @@
     #include <sys/un.h>
     #include <sys/file.h>
     #include <sys/stat.h>
+    #include <sys/statvfs.h>
+    #include <sys/wait.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>
     #include <unistd.h>
@@ -80,13 +85,88 @@
 /* ===================================================================== */
 
 #define DEFAULT_PORT 1920
-#define TOP_K 10
+#define DEFAULT_TOP_K 50
+#define MAX_TOP_K 100
 #define INITIAL_CAP 4096
 #define MAX_LINE (1 << 24)
-#define PIPE_BUF_SIZE (1 << 16)
+#define PIPE_BUF_SIZE (1 << 20)
 
 #define FMT_F32 0
 #define FMT_F16 1
+
+/* VEC 2.0 binary frame protocol — see PROTOCOL-2.0.md */
+#define BIN_MAGIC        0xF0
+#define PROTOCOL_VERSION 0x02
+
+#define CMD_PUSH      0x01
+#define CMD_QUERY     0x02   /* unified PULL+CPULL */
+/*      0x03            removed — was CPULL */
+#define CMD_GET       0x04   /* unified GET+MGET */
+/*      0x05            removed — was MGET */
+#define CMD_UPDATE    0x06
+#define CMD_DELETE    0x07
+#define CMD_LABEL     0x08
+#define CMD_UNDO      0x09
+#define CMD_SAVE      0x0A
+/*      0x0B, 0x0C      reserved (do not reuse) */
+#define CMD_CLUSTER   0x0D
+#define CMD_DISTINCT  0x0E
+#define CMD_REPRESENT 0x0F
+#define CMD_INFO      0x10
+#define CMD_QID       0x11   /* unified PID+CPID */
+/*      0x12            removed — was CPID */
+#define CMD_SET_DATA  0x13
+#define CMD_GET_DATA  0x14
+
+/* response envelope */
+#define RESP_OK  0x00
+#define RESP_ERR 0x01
+
+/* shape mask bits */
+#define SHAPE_VECTOR 0x01
+#define SHAPE_LABEL  0x02
+#define SHAPE_DATA   0x04
+
+/* GET mode */
+#define GET_MODE_SINGLE 0x00
+#define GET_MODE_BATCH  0x01
+
+/* metric */
+#define METRIC_L2     0x00
+#define METRIC_COSINE 0x01
+
+#ifdef _WIN32
+#define strtok_r strtok_s
+#endif
+
+/* ===================================================================== */
+/*  Elapsed-time helper                                                  */
+/* ===================================================================== */
+
+static long long now_ms() {
+#ifdef _WIN32
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (long long)((c.QuadPart * 1000LL) / f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+#endif
+}
+
+static void format_elapsed(long long ms, char *out, int outsz) {
+    if (ms < 1000)        snprintf(out, outsz, "%lldms", ms);
+    else if (ms < 60000)  snprintf(out, outsz, "%.1fs", ms / 1000.0);
+    else if (ms < 3600000) {
+        long long m = ms / 60000, s = (ms % 60000) / 1000;
+        snprintf(out, outsz, "%lldm%llds", m, s);
+    } else {
+        long long h = ms / 3600000, m = (ms % 3600000) / 60000;
+        snprintf(out, outsz, "%lldh%lldm", h, m);
+    }
+}
 
 /* ===================================================================== */
 /*  CRC32                                                                */
@@ -160,6 +240,7 @@ static char g_name[256];
 static char g_filepath[512];
 static int g_dim = 0;
 static int g_port = DEFAULT_PORT;
+static int g_topk = DEFAULT_TOP_K;
 static int g_fmt = FMT_F32;
 static int g_elem_size = 4;
 
@@ -168,12 +249,8 @@ static int g_count = 0;
 static int g_capacity = 0;
 
 static void *d_vectors = NULL;
-static void *d_query = NULL;
-static float *d_dists = NULL;
 static float *h_dists = NULL;
 static int *h_ids = NULL;
-static float *h_pinned = NULL;
-static int h_pinned_n = 0;
 
 static unsigned char *g_alive = NULL;
 static int g_alive_cap = 0;
@@ -183,6 +260,15 @@ static int g_deleted = 0;
 static char **g_labels = NULL;  /* array of pointers, NULL = no label */
 static int g_labels_cap = 0;
 
+/* data blobs: variable-length opaque payloads indexed by slot, ≤ MAX_DATA_BYTES each */
+#define MAX_DATA_BYTES 102400
+#define MAX_LABEL_BYTES 2048
+static unsigned char **g_blobs = NULL;
+static unsigned int  *g_blob_lens = NULL;
+static int g_blobs_cap = 0;
+
+static int g_dirty = 0;
+static int g_readonly = 0;
 static volatile int g_running = 1;
 
 #ifdef _WIN32
@@ -191,10 +277,6 @@ static volatile int g_running = 1;
     static char g_sockpath[512];
     static int g_lockfd = -1;
 #endif
-
-/* ===================================================================== */
-/*  Helpers                                                              */
-/* ===================================================================== */
 
 /* ===================================================================== */
 /*  Memory management                                                    */
@@ -211,9 +293,6 @@ static void gpu_realloc_if_needed(int required) {
     free(d_vectors);
     d_vectors = d_new;
 
-    free(d_dists);
-    d_dists = (float *)malloc(new_cap * sizeof(float));
-
     free(h_dists);
     free(h_ids);
     h_dists = (float *)malloc(new_cap * sizeof(float));
@@ -229,14 +308,20 @@ static void gpu_realloc_if_needed(int required) {
     g_labels = new_labels;
     g_labels_cap = new_cap;
 
+    unsigned char **new_blobs = (unsigned char **)realloc(g_blobs, new_cap * sizeof(unsigned char *));
+    memset(new_blobs + g_blobs_cap, 0, (new_cap - g_blobs_cap) * sizeof(unsigned char *));
+    g_blobs = new_blobs;
+    unsigned int *new_blob_lens = (unsigned int *)realloc(g_blob_lens, new_cap * sizeof(unsigned int));
+    memset(new_blob_lens + g_blobs_cap, 0, (new_cap - g_blobs_cap) * sizeof(unsigned int));
+    g_blob_lens = new_blob_lens;
+    g_blobs_cap = new_cap;
+
     g_capacity = new_cap;
 }
 
 static void gpu_init() {
     g_capacity = INITIAL_CAP;
     d_vectors = malloc((size_t)g_capacity * g_dim * g_elem_size);
-    d_query = malloc(g_dim * g_elem_size);
-    d_dists = (float *)malloc(g_capacity * sizeof(float));
 
     h_dists = (float *)malloc(g_capacity * sizeof(float));
     h_ids = (int *)malloc(g_capacity * sizeof(int));
@@ -247,22 +332,13 @@ static void gpu_init() {
     g_labels = (char **)calloc(g_capacity, sizeof(char *));
     g_labels_cap = g_capacity;
 
-    h_pinned_n = 1024 * g_dim;
-    h_pinned = (float *)malloc(h_pinned_n * sizeof(float));
-}
-
-static void gpu_ensure_pinned(int nfloats) {
-    if (nfloats <= h_pinned_n) return;
-    free(h_pinned);
-    h_pinned_n = nfloats;
-    h_pinned = (float *)malloc(h_pinned_n * sizeof(float));
+    g_blobs = (unsigned char **)calloc(g_capacity, sizeof(unsigned char *));
+    g_blob_lens = (unsigned int *)calloc(g_capacity, sizeof(unsigned int));
+    g_blobs_cap = g_capacity;
 }
 
 static void gpu_shutdown() {
     free(d_vectors);
-    free(d_query);
-    free(d_dists);
-    free(h_pinned);
     free(h_dists);
     free(h_ids);
     free(g_alive);
@@ -270,6 +346,11 @@ static void gpu_shutdown() {
         for (int i = 0; i < g_labels_cap; i++) free(g_labels[i]);
         free(g_labels);
     }
+    if (g_blobs) {
+        for (int i = 0; i < g_blobs_cap; i++) free(g_blobs[i]);
+        free(g_blobs);
+    }
+    free(g_blob_lens);
 }
 
 /* ===================================================================== */
@@ -280,49 +361,74 @@ static void upload_and_store(const float *h_data, void *d_dest, int nfloats) {
     memcpy(d_dest, h_data, nfloats * sizeof(float));
 }
 
-static void vec_set_label(int slot, const char *label, int len) {
+/* validate label: 0 ok, -1 invalid char, -2 too long, -3 empty.
+ * rejected: control chars, space, and : * ? " < > | ,
+ * allowed:  / \ . _ - = ! ' ^ + % & ( ) [ ] { } @ # $ ~ ` ; alphanumerics, etc. */
+static int validate_label(const char *label, int len) {
+    if (len <= 0) return -3;
+    if (len > MAX_LABEL_BYTES) return -2;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)label[i];
+        if (c <= 0x1F || c == 0x7F) return -1;
+        if (c == ' ' || c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|' || c == ',') return -1;
+    }
+    return 0;
+}
+
+/* lenient label setter — used by .meta load only (matches 1.x). */
+static void vec_set_label_raw(int slot, const char *label, int len) {
     if (slot < 0 || slot >= g_labels_cap) return;
     free(g_labels[slot]);
     if (!label || len <= 0) { g_labels[slot] = NULL; return; }
-
-    /* strip UTF-8 BOM */
     if (len >= 3 && (unsigned char)label[0] == 0xEF &&
         (unsigned char)label[1] == 0xBB && (unsigned char)label[2] == 0xBF) {
         label += 3; len -= 3;
     }
-
-    /* trim leading/trailing whitespace */
-    while (len > 0 && (*label == ' ' || *label == '\t')) { label++; len--; }
-    while (len > 0 && (label[len - 1] == ' ' || label[len - 1] == '\t')) len--;
     if (len <= 0) { g_labels[slot] = NULL; return; }
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) { g_labels[slot] = NULL; return; }
+    memcpy(buf, label, len);
+    buf[len] = '\0';
+    g_labels[slot] = buf;
+}
 
-    /* sanitize: escape control chars, strip colons and commas */
-    char *clean = (char *)malloc(len * 2 + 1);
-    int out = 0;
-    int warned = 0;
-    for (int i = 0; i < len; i++) {
-        char c = label[i];
-        if (c == '\n' || c == '\r') {
-            if (c == '\r' && i + 1 < len && label[i + 1] == '\n') i++;
-            clean[out++] = '\\'; clean[out++] = 'n';
-        } else if (c == '\t') {
-            clean[out++] = '\\'; clean[out++] = 't';
-        } else if (c == ':' || c == ',') {
-            if (!warned) {
-                fprintf(stderr, "WARN: label for slot %d contains '%c', stripped\n", slot, c);
-                warned = 1;
-            }
-        } else {
-            clean[out++] = c;
-        }
-    }
-    if (out > 0) {
-        clean[out] = '\0';
-        g_labels[slot] = clean;
-    } else {
-        free(clean);
+/* strict label setter — used by all wire write paths. returns 0 ok, validate_label codes on error. */
+static int vec_set_label(int slot, const char *label, int len) {
+    if (slot < 0 || slot >= g_labels_cap) return -1;
+    if (!label || len <= 0) {
+        free(g_labels[slot]);
         g_labels[slot] = NULL;
+        return 0;
     }
+    int rc = validate_label(label, len);
+    if (rc != 0) return rc;
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) return -1;
+    memcpy(buf, label, len);
+    buf[len] = '\0';
+    free(g_labels[slot]);
+    g_labels[slot] = buf;
+    return 0;
+}
+
+/* opaque blob setter. len=0 clears. */
+static int vec_set_blob(int slot, const unsigned char *bytes, unsigned int len) {
+    if (slot < 0 || slot >= g_blobs_cap) return -1;
+    if (len > MAX_DATA_BYTES) return -2;
+    if (!bytes || len == 0) {
+        free(g_blobs[slot]);
+        g_blobs[slot] = NULL;
+        g_blob_lens[slot] = 0;
+        return 0;
+    }
+    unsigned char *buf = (unsigned char *)malloc(len);
+    if (!buf) return -1;
+    memcpy(buf, bytes, len);
+    free(g_blobs[slot]);
+    g_blobs[slot] = buf;
+    g_blob_lens[slot] = len;
+    return 0;
 }
 
 static int vec_push(const float *h_vec) {
@@ -330,6 +436,7 @@ static int vec_push(const float *h_vec) {
     int slot = g_count;
     upload_and_store(h_vec, (char *)d_vectors + (size_t)slot * g_dim * g_elem_size, g_dim);
     g_count++;
+    g_dirty = 1;
     return slot;
 }
 
@@ -337,14 +444,10 @@ static int vec_pull(const float *h_query, int *out_ids, float *out_dists, int mo
     int alive = g_count - g_deleted;
     if (alive <= 0) return 0;
     int n = g_count;
-    int k = (alive < TOP_K) ? alive : TOP_K;
+    int k = (alive < g_topk) ? alive : g_topk;
 
-    memcpy(d_query, h_query, g_dim * sizeof(float));
-
-    if (mode == 1) cpu_cos_f32((const float *)d_vectors, (const float *)d_query, (float *)d_dists, n, g_dim);
-    else cpu_l2_f32((const float *)d_vectors, (const float *)d_query, (float *)d_dists, n, g_dim);
-
-    memcpy(h_dists, d_dists, n * sizeof(float));
+    if (mode == 1) cpu_cos_f32((const float *)d_vectors, h_query, h_dists, n, g_dim);
+    else cpu_l2_f32((const float *)d_vectors, h_query, h_dists, n, g_dim);
 
     for (int i = 0; i < n; i++) {
         h_ids[i] = i;
@@ -368,11 +471,174 @@ static int vec_pull(const float *h_query, int *out_ids, float *out_dists, int mo
 }
 
 /* ===================================================================== */
+/*  Clustering (DBSCAN)                                                  */
+/* ===================================================================== */
+
+typedef int (*write_fn)(void *ctx, const char *buf, int len);
+
+#define CLUSTER_UNVISITED -1
+#define CLUSTER_NOISE     -2
+
+static void vec_cluster(float eps, int min_pts, int mode, write_fn writer, void *wctx) {
+    int n = g_count;
+    int alive = n - g_deleted;
+    if (alive <= 0) {
+        writer(wctx, "end\n", 4);
+        return;
+    }
+
+    float eps_sq = (mode == 1) ? eps : eps * eps;
+
+    int *cluster_id = (int *)malloc(n * sizeof(int));
+    for (int i = 0; i < n; i++)
+        cluster_id[i] = g_alive[i] ? CLUSTER_UNVISITED : CLUSTER_NOISE;
+
+    int *queue = (int *)malloc(n * sizeof(int));
+    float *dists_buf = (float *)malloc(n * sizeof(float));
+
+    int cluster = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (cluster_id[i] != CLUSTER_UNVISITED) continue;
+
+        const float *query = (const float *)d_vectors + (size_t)i * g_dim;
+        if (mode == 1) cpu_cos_f32((const float *)d_vectors, query, dists_buf, n, g_dim);
+        else cpu_l2_f32((const float *)d_vectors, query, dists_buf, n, g_dim);
+
+        int q_head = 0, q_tail = 0;
+        int neighbor_count = 0;
+        for (int j = 0; j < n; j++) {
+            if (!g_alive[j]) continue;
+            if (dists_buf[j] <= eps_sq) {
+                queue[q_tail++] = j;
+                neighbor_count++;
+            }
+        }
+
+        if (neighbor_count < min_pts) {
+            cluster_id[i] = CLUSTER_NOISE;
+            continue;
+        }
+
+        cluster_id[i] = cluster;
+
+        while (q_head < q_tail) {
+            int j = queue[q_head++];
+            if (cluster_id[j] == CLUSTER_NOISE) cluster_id[j] = cluster;
+            if (cluster_id[j] != CLUSTER_UNVISITED) continue;
+            cluster_id[j] = cluster;
+
+            const float *q2 = (const float *)d_vectors + (size_t)j * g_dim;
+            if (mode == 1) cpu_cos_f32((const float *)d_vectors, q2, dists_buf, n, g_dim);
+            else cpu_l2_f32((const float *)d_vectors, q2, dists_buf, n, g_dim);
+
+            int j_neighbors = 0;
+            for (int k = 0; k < n; k++) {
+                if (!g_alive[k]) continue;
+                if (dists_buf[k] <= eps_sq) j_neighbors++;
+            }
+            if (j_neighbors >= min_pts) {
+                for (int k = 0; k < n; k++) {
+                    if (!g_alive[k]) continue;
+                    if (dists_buf[k] <= eps_sq && (cluster_id[k] == CLUSTER_UNVISITED || cluster_id[k] == CLUSTER_NOISE)) {
+                        if (cluster_id[k] == CLUSTER_NOISE) cluster_id[k] = cluster;
+                        else queue[q_tail++] = k;
+                    }
+                }
+            }
+        }
+        cluster++;
+    }
+
+    char line[256];
+    int line_len;
+
+    for (int c = 0; c < cluster; c++) {
+        int first = 1;
+        for (int i = 0; i < n; i++) {
+            if (cluster_id[i] != c) continue;
+            const char *lbl = (i < g_labels_cap) ? g_labels[i] : NULL;
+            if (lbl)
+                line_len = snprintf(line, sizeof(line), "%s%s", first ? "" : ",", lbl);
+            else
+                line_len = snprintf(line, sizeof(line), "%s%d", first ? "" : ",", i);
+            writer(wctx, line, line_len);
+            first = 0;
+        }
+        writer(wctx, "\n", 1);
+    }
+
+    {
+        int first = 1;
+        int has_noise = 0;
+        for (int i = 0; i < n; i++) {
+            if (cluster_id[i] != CLUSTER_NOISE || !g_alive[i]) continue;
+            has_noise = 1;
+            const char *lbl = (i < g_labels_cap) ? g_labels[i] : NULL;
+            if (lbl)
+                line_len = snprintf(line, sizeof(line), "%s%s", first ? "" : ",", lbl);
+            else
+                line_len = snprintf(line, sizeof(line), "%s%d", first ? "" : ",", i);
+            writer(wctx, line, line_len);
+            first = 0;
+        }
+        if (has_noise) writer(wctx, "\n", 1);
+    }
+
+    line_len = snprintf(line, sizeof(line), "end\n");
+    writer(wctx, line, line_len);
+
+    free(cluster_id);
+    free(queue);
+    free(dists_buf);
+}
+
+/* ===================================================================== */
 /*  Persistence                                                          */
 /* ===================================================================== */
 
+static unsigned int g_loaded_crc = 0;
+static unsigned int g_computed_crc = 0;
+static int g_crc_ok = 0;
+
+static long long estimate_file_size() {
+    long long tensors = 13LL + g_count + (long long)g_count * g_dim * g_elem_size + 4;
+    long long meta = 4; /* count header */
+    for (int i = 0; i < g_count; i++)
+        meta += 4 + (g_labels[i] ? (long long)strlen(g_labels[i]) : 0);
+    return tensors + meta;
+}
+
 static void save_to_file() {
     if (g_count == 0) return;
+    if (g_readonly) return;
+    if (!g_dirty && g_crc_ok == 1) return;
+
+    long long t_save_start = now_ms();
+
+    /* disk space check */
+    long long needed = estimate_file_size() + (1024 * 1024);
+#ifdef _WIN32
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExA(NULL, &free_bytes, NULL, NULL)) {
+        if ((long long)free_bytes.QuadPart < needed) {
+            fprintf(stderr, "ERROR: not enough disk space (need %lld bytes, have %llu)\n",
+                    needed, (unsigned long long)free_bytes.QuadPart);
+            return;
+        }
+    }
+#else
+    struct statvfs st;
+    if (statvfs(".", &st) == 0) {
+        long long avail = (long long)st.f_bavail * st.f_frsize;
+        if (avail < needed) {
+            fprintf(stderr, "ERROR: not enough disk space (need %lld bytes, have %lld)\n",
+                    needed, avail);
+            return;
+        }
+    }
+#endif
+
     FILE *f = fopen(g_filepath, "wb");
     if (!f) { fprintf(stderr, "ERROR: cannot open %s for writing\n", g_filepath); return; }
 
@@ -396,7 +662,14 @@ static void save_to_file() {
     fclose(f);
     char crc_name[16];
     crc32_word(crc, crc_name);
-    printf("saved %d vectors to %s [%s 0x%08X]\n", g_count, g_filepath, crc_name, crc);
+    g_dirty = 0;
+    g_crc_ok = 1;
+    g_loaded_crc = crc;
+    g_computed_crc = crc;
+    {
+        char el[32]; format_elapsed(now_ms() - t_save_start, el, sizeof(el));
+        printf("saved %d vectors to %s [%s 0x%08X] (%s)\n", g_count, g_filepath, crc_name, crc, el);
+    }
 
     /* save labels to .meta sidecar */
     int has_labels = 0;
@@ -417,6 +690,41 @@ static void save_to_file() {
                 if (slen > 0) fwrite(g_labels[i], 1, slen, mf);
             }
             fclose(mf);
+        }
+    }
+
+    /* save data blobs to .data sidecar */
+    int has_blobs = 0;
+    for (int i = 0; i < g_count; i++) { if (g_blobs[i] && g_blob_lens[i] > 0) { has_blobs = 1; break; } }
+    if (has_blobs) {
+        char datapath[512];
+        strncpy(datapath, g_filepath, sizeof(datapath) - 1);
+        char *ext = strstr(datapath, ".tensors");
+        if (ext) strcpy(ext, ".data");
+        else snprintf(datapath, sizeof(datapath), "%s.data", g_name);
+
+        FILE *df = fopen(datapath, "wb");
+        if (df) {
+            unsigned char *mask = (unsigned char *)malloc(g_count);
+            if (mask) {
+                for (int i = 0; i < g_count; i++) {
+                    mask[i] = (g_blobs[i] && g_blob_lens[i] > 0) ? 1 : 0;
+                }
+                fwrite(&g_count, sizeof(int), 1, df);
+                fwrite(mask, 1, g_count, df);
+                unsigned int dcrc = crc32_update(0, mask, g_count);
+                for (int i = 0; i < g_count; i++) {
+                    if (!mask[i]) continue;
+                    unsigned int dlen = g_blob_lens[i];
+                    fwrite(&dlen, sizeof(unsigned int), 1, df);
+                    fwrite(g_blobs[i], 1, dlen, df);
+                    dcrc = crc32_update(dcrc, (const unsigned char *)&dlen, sizeof(unsigned int));
+                    dcrc = crc32_update(dcrc, g_blobs[i], dlen);
+                }
+                fwrite(&dcrc, sizeof(unsigned int), 1, df);
+                free(mask);
+            }
+            fclose(df);
         }
     }
 }
@@ -448,9 +756,7 @@ static int peek_file_header() {
     return 1;
 }
 
-static unsigned int g_loaded_crc = 0;
-static unsigned int g_computed_crc = 0;
-static int g_crc_ok = 0;
+/* g_loaded_crc, g_computed_crc, g_crc_ok moved before save_to_file */
 
 static int load_from_file() {
     FILE *f = fopen(g_filepath, "rb");
@@ -533,28 +839,42 @@ static int load_from_file() {
         fclose(mf);
     }
 
+    /* load data blobs from .data sidecar */
+    char datapath[512];
+    strncpy(datapath, g_filepath, sizeof(datapath) - 1);
+    char *dext = strstr(datapath, ".tensors");
+    if (dext) strcpy(dext, ".data");
+    else snprintf(datapath, sizeof(datapath), "%s.data", g_name);
+
+    FILE *df = fopen(datapath, "rb");
+    if (df) {
+        int data_count = 0;
+        if (fread(&data_count, sizeof(int), 1, df) == 1 && data_count > 0 && data_count <= g_count) {
+            unsigned char *mask = (unsigned char *)malloc(data_count);
+            if (mask && fread(mask, 1, data_count, df) == (size_t)data_count) {
+                for (int i = 0; i < data_count; i++) {
+                    if (!mask[i]) continue;
+                    unsigned int dlen = 0;
+                    if (fread(&dlen, sizeof(unsigned int), 1, df) != 1) break;
+                    if (dlen == 0 || dlen > MAX_DATA_BYTES) break;
+                    unsigned char *buf = (unsigned char *)malloc(dlen);
+                    if (!buf) break;
+                    if (fread(buf, 1, dlen, df) != (size_t)dlen) { free(buf); break; }
+                    g_blobs[i] = buf;
+                    g_blob_lens[i] = dlen;
+                }
+            }
+            free(mask);
+        }
+        fclose(df);
+    }
+
     return 1;
 }
 
 /* ===================================================================== */
-/*  Protocol parser                                                      */
+/*  Protocol helpers                                                     */
 /* ===================================================================== */
-
-static int parse_floats(const char *s, float *out, int max_n) {
-    int n = 0;
-    const char *p = s;
-    while (*p && n < max_n) {
-        char *end;
-        float v = strtof(p, &end);
-        if (end == p) break;
-        out[n++] = v;
-        p = end;
-        if (*p == ',') p++;
-    }
-    return n;
-}
-
-typedef int (*write_fn)(void *ctx, const char *buf, int len);
 
 /* format results: label:dist or index:dist per result, comma-separated */
 static void format_results(int *ids, float *dists, int k, write_fn writer, void *wctx) {
@@ -574,220 +894,520 @@ static void format_results(int *ids, float *dists, int k, write_fn writer, void 
     writer(wctx, resp, (int)(p - resp));
 }
 
-static int process_command(const char *line, int line_len, write_fn writer, void *wctx, const char *bin_payload, int bin_payload_len) {
-    char resp[4096];
-    int rlen;
+/* ===================================================================== */
+/*  Binary frame protocol                                                */
+/* ===================================================================== */
 
-    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) line_len--;
-    if (line_len == 0) return 0;
+/* VEC 2.0: body_len is explicit (4B u32 after label) — no per-cmd inference. */
+static int frame_data_len(unsigned char cmd, const char *data_start, int available, int label_len) {
+    (void)label_len;
+    switch (cmd) {
+        case CMD_PUSH:
+        case CMD_QUERY:
+        case CMD_GET:
+        case CMD_UPDATE:
+        case CMD_DELETE:
+        case CMD_LABEL:
+        case CMD_UNDO:
+        case CMD_SAVE:
+        case CMD_CLUSTER:
+        case CMD_DISTINCT:
+        case CMD_REPRESENT:
+        case CMD_INFO:
+        case CMD_QID:
+        case CMD_SET_DATA:
+        case CMD_GET_DATA:
+            if (available < 4) return -1;
+            unsigned int blen;
+            memcpy(&blen, data_start, 4);
+            return (int)blen;
+        default:
+            return -2;
+    }
+}
 
-    /* push [label] floats  OR  push floats */
-    /* push ["quoted label"|label] floats */
-    if (line_len > 5 && strncmp(line, "push ", 5) == 0) {
-        const char *data = line + 5;
-        int data_len = line_len - 5;
-        const char *label = NULL;
-        int label_len = 0;
-        const char *floats_start = data;
+/* write one vector from memory to client as raw fp32 — zero-copy from d_vectors */
+static int bin_write_vec(int idx, write_fn writer, void *wctx) {
+    writer(wctx, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim * (int)sizeof(float));
+    return 0;
+}
 
-        if (*data == '"') {
-            /* quoted label: push "some text here" 0.12,0.23,... */
-            const char *close = (const char *)memchr(data + 1, '"', data_len - 1);
-            if (close) {
-                label = data + 1;
-                label_len = (int)(close - data - 1);
-                floats_start = close + 1;
-                while (*floats_start == ' ') floats_start++;
+/* ===================================================================== */
+/*  2.0 response envelope helpers                                        */
+/* ===================================================================== */
+
+static void resp_ok_header(write_fn writer, void *wctx, unsigned int body_len) {
+    char hdr[5];
+    hdr[0] = (char)RESP_OK;
+    memcpy(hdr + 1, &body_len, 4);
+    writer(wctx, hdr, 5);
+}
+static void resp_ok_empty(write_fn writer, void *wctx) {
+    char hdr[5] = { (char)RESP_OK, 0, 0, 0, 0 };
+    writer(wctx, hdr, 5);
+}
+static void resp_err(write_fn writer, void *wctx, const char *msg) {
+    unsigned int el = (unsigned int)strlen(msg);
+    char hdr[5];
+    hdr[0] = (char)RESP_ERR;
+    memcpy(hdr + 1, &el, 4);
+    writer(wctx, hdr, 5);
+    if (el > 0) writer(wctx, msg, (int)el);
+}
+
+/* scratch writer — collects writer_fn output into a growable buffer. */
+typedef struct {
+    char *buf;
+    unsigned int len;
+    unsigned int cap;
+    int oom;
+} scratch_writer_ctx;
+static void scratch_writer_init(scratch_writer_ctx *s) { s->buf = NULL; s->len = 0; s->cap = 0; s->oom = 0; }
+static void scratch_writer_free(scratch_writer_ctx *s) { free(s->buf); s->buf = NULL; s->len = 0; s->cap = 0; }
+static int scratch_writer_fn(void *ctx, const char *data, int n) {
+    scratch_writer_ctx *s = (scratch_writer_ctx *)ctx;
+    if (s->oom || n <= 0) return n;
+    unsigned int need = s->len + (unsigned int)n;
+    if (need > s->cap) {
+        unsigned int newcap = s->cap ? s->cap * 2 : 4096;
+        while (newcap < need) newcap *= 2;
+        char *nb = (char *)realloc(s->buf, newcap);
+        if (!nb) { s->oom = 1; return n; }
+        s->buf = nb; s->cap = newcap;
+    }
+    memcpy(s->buf + s->len, data, n);
+    s->len += (unsigned int)n;
+    return n;
+}
+
+/* compute body length for a record under a shape mask */
+static unsigned int record_body_len(int idx, unsigned char shape, int with_distance) {
+    unsigned int n = 4;
+    if (with_distance) n += 4;
+    if (shape & SHAPE_LABEL) {
+        unsigned int ll = (idx >= 0 && idx < g_labels_cap && g_labels[idx]) ? (unsigned int)strlen(g_labels[idx]) : 0;
+        n += 4 + ll;
+    }
+    if (shape & SHAPE_DATA) {
+        unsigned int dl = (idx >= 0 && idx < g_blobs_cap && g_blobs[idx]) ? g_blob_lens[idx] : 0;
+        n += 4 + dl;
+    }
+    if (shape & SHAPE_VECTOR) n += g_dim * 4;
+    return n;
+}
+
+static char *build_result_body(const int *ids, const float *dists, int count, unsigned char shape,
+                               int with_distance, unsigned int *out_len) {
+    unsigned int total = 4;
+    for (int i = 0; i < count; i++) total += record_body_len(ids[i], shape, with_distance);
+    char *buf = (char *)malloc(total);
+    if (!buf) return NULL;
+    char *p = buf;
+    unsigned int u_count = (unsigned int)count;
+    memcpy(p, &u_count, 4); p += 4;
+    for (int i = 0; i < count; i++) {
+        int idx = ids[i];
+        memcpy(p, &idx, 4); p += 4;
+        if (with_distance) { float d = dists[i]; memcpy(p, &d, 4); p += 4; }
+        if (shape & SHAPE_LABEL) {
+            unsigned int ll = (idx >= 0 && idx < g_labels_cap && g_labels[idx]) ? (unsigned int)strlen(g_labels[idx]) : 0;
+            memcpy(p, &ll, 4); p += 4;
+            if (ll > 0) { memcpy(p, g_labels[idx], ll); p += ll; }
+        }
+        if (shape & SHAPE_DATA) {
+            unsigned int dl = (idx >= 0 && idx < g_blobs_cap && g_blobs[idx]) ? g_blob_lens[idx] : 0;
+            memcpy(p, &dl, 4); p += 4;
+            if (dl > 0) { memcpy(p, g_blobs[idx], dl); p += dl; }
+        }
+        if (shape & SHAPE_VECTOR) {
+            memcpy(p, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim * sizeof(float));
+            p += g_dim * 4;
+        }
+    }
+    *out_len = total;
+    return buf;
+}
+
+/* resolve label to a single index, -1 if not found, -2 if ambiguous */
+static int resolve_label(const char *label, int label_len) {
+    int idx = -1;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_alive[i] || !g_labels[i]) continue;
+        if ((int)strlen(g_labels[i]) == label_len && strncmp(g_labels[i], label, label_len) == 0) {
+            if (idx >= 0) return -2;
+            idx = i;
+        }
+    }
+    return idx;
+}
+
+/* resolve label to all matching indices, returns count */
+static int resolve_label_all(const char *label, int label_len, int **out_ids) {
+    int *ids = NULL;
+    int count = 0;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_alive[i] || !g_labels[i]) continue;
+        if ((int)strlen(g_labels[i]) == label_len && strncmp(g_labels[i], label, label_len) == 0) {
+            int *tmp = (int *)realloc(ids, (count + 1) * sizeof(int));
+            if (!tmp) { free(ids); *out_ids = NULL; return 0; }
+            ids = tmp;
+            ids[count++] = i;
+        }
+    }
+    *out_ids = ids;
+    return count;
+}
+
+static int process_binary_frame(unsigned char cmd, const char *label, int label_len,
+                                const char *data, int data_len,
+                                write_fn writer, void *wctx) {
+    if (g_readonly) {
+        if (cmd == CMD_PUSH || cmd == CMD_UPDATE || cmd == CMD_DELETE ||
+            cmd == CMD_LABEL || cmd == CMD_UNDO || cmd == CMD_SAVE || cmd == CMD_SET_DATA) {
+            resp_err(writer, wctx, "read-only mode");
+            return 0;
+        }
+    }
+
+    switch (cmd) {
+
+    case CMD_PUSH: {
+        int vbytes = g_dim * (int)sizeof(float);
+        if (data_len < vbytes + 4) { resp_err(writer, wctx, "body too short"); return 0; }
+        unsigned int dlen;
+        memcpy(&dlen, data + vbytes, 4);
+        if (data_len != vbytes + 4 + (int)dlen) { resp_err(writer, wctx, "body length mismatch"); return 0; }
+        if (dlen > MAX_DATA_BYTES) { resp_err(writer, wctx, "data too large"); return 0; }
+        if (dlen > 0 && label_len <= 0) { resp_err(writer, wctx, "data requires label"); return 0; }
+        if (label_len > 0) {
+            int rc = validate_label(label, label_len);
+            if (rc == -1) { resp_err(writer, wctx, "label has invalid chars"); return 0; }
+            if (rc == -2) { resp_err(writer, wctx, "label too long"); return 0; }
+            if (rc == -3) { resp_err(writer, wctx, "label empty"); return 0; }
+        }
+        int slot = vec_push((const float *)data);
+        if (label_len > 0) {
+            if (vec_set_label(slot, label, label_len) != 0) {
+                g_count--;
+                resp_err(writer, wctx, "label store failed");
+                return 0;
             }
+        }
+        if (dlen > 0) {
+            if (vec_set_blob(slot, (const unsigned char *)(data + vbytes + 4), dlen) != 0) {
+                resp_err(writer, wctx, "data store failed");
+                return 0;
+            }
+        }
+        char body[4]; memcpy(body, &slot, 4);
+        resp_ok_header(writer, wctx, 4);
+        writer(wctx, body, 4);
+        return 0;
+    }
+
+    case CMD_QUERY: {
+        int vbytes = g_dim * (int)sizeof(float);
+        if (data_len != 1 + 1 + vbytes) { resp_err(writer, wctx, "bad query body"); return 0; }
+        unsigned char metric = (unsigned char)data[0];
+        unsigned char shape  = (unsigned char)data[1];
+        if (metric > METRIC_COSINE) { resp_err(writer, wctx, "bad metric"); return 0; }
+        const float *qv = (const float *)(data + 2);
+        int ids[MAX_TOP_K]; float dists[MAX_TOP_K];
+        int k = vec_pull(qv, ids, dists, metric);
+        unsigned int blen;
+        char *body = build_result_body(ids, dists, k, shape, 1, &blen);
+        if (!body) { resp_err(writer, wctx, "out of memory"); return 0; }
+        resp_ok_header(writer, wctx, blen);
+        writer(wctx, body, (int)blen);
+        free(body);
+        return 0;
+    }
+
+    case CMD_QID: {
+        if (data_len < 2) { resp_err(writer, wctx, "bad qid body"); return 0; }
+        unsigned char metric = (unsigned char)data[0];
+        unsigned char shape  = (unsigned char)data[1];
+        if (metric > METRIC_COSINE) { resp_err(writer, wctx, "bad metric"); return 0; }
+        int idx;
+        if (label_len > 0) {
+            if (data_len != 2) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+            idx = resolve_label(label, label_len);
+            if (idx == -2) { resp_err(writer, wctx, "ambiguous label"); return 0; }
+            if (idx < 0)   { resp_err(writer, wctx, "label not found"); return 0; }
         } else {
-            /* unquoted: scan for first float-like token with a comma */
-            for (const char *s = data; s < data + data_len; s++) {
-                if ((*s >= '0' && *s <= '9') || *s == '-' || *s == '.') {
-                    const char *t = s;
-                    while (t < data + data_len && *t != ' ' && *t != '\n') t++;
-                    for (const char *c = s; c < t; c++) {
-                        if (*c == ',') { floats_start = s; goto found_push; }
-                    }
-                    if (t >= data + data_len) { floats_start = s; goto found_push; }
-                }
-            }
-        found_push:
-            if (floats_start > data) {
-                label = data;
-                label_len = (int)(floats_start - data);
-                while (label_len > 0 && label[label_len - 1] == ' ') label_len--;
-            }
+            if (data_len != 6) { resp_err(writer, wctx, "bad qid body"); return 0; }
+            memcpy(&idx, data + 2, 4);
+            if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+            if (!g_alive[idx]) { resp_err(writer, wctx, "deleted"); return 0; }
         }
-
-        float *vals = (float *)malloc(g_dim * sizeof(float));
-        int n = parse_floats(floats_start, vals, g_dim);
-        if (n != g_dim) {
-            rlen = snprintf(resp, sizeof(resp), "err dim mismatch: got %d, expected %d\n", n, g_dim);
-            writer(wctx, resp, rlen);
-            free(vals);
-            return 0;
-        }
-        int slot = vec_push(vals);
-        free(vals);
-        if (label_len > 0) vec_set_label(slot, label, label_len);
-        rlen = snprintf(resp, sizeof(resp), "%d\n", slot);
-        writer(wctx, resp, rlen);
+        int ids[MAX_TOP_K]; float dists[MAX_TOP_K];
+        const float *qvec = (const float *)((char *)d_vectors + (size_t)idx * g_dim * g_elem_size);
+        int k = vec_pull(qvec, ids, dists, metric);
+        unsigned int blen;
+        char *body = build_result_body(ids, dists, k, shape, 1, &blen);
+        if (!body) { resp_err(writer, wctx, "out of memory"); return 0; }
+        resp_ok_header(writer, wctx, blen);
+        writer(wctx, body, (int)blen);
+        free(body);
         return 0;
     }
 
-    /* bpush [label]\n<dim*4 bytes> */
-    if (line_len >= 5 && strncmp(line, "bpush", 5) == 0) {
-        int expected_bytes = g_dim * (int)sizeof(float);
-        if (bin_payload_len != expected_bytes) {
-            rlen = snprintf(resp, sizeof(resp), "err need %d bytes, got %d\n", expected_bytes, bin_payload_len);
-            writer(wctx, resp, rlen);
-            return 0;
-        }
-        /* label is anything after "bpush " - quoted or unquoted */
-        const char *label = NULL;
-        int label_len = 0;
-        if (line_len > 6) {
-            const char *lstart = line + 6;
-            int llen = line_len - 6;
-            while (llen > 0 && (lstart[llen - 1] == ' ' || lstart[llen - 1] == '\r')) llen--;
-            if (llen > 0 && lstart[0] == '"' && lstart[llen - 1] == '"') {
-                label = lstart + 1;
-                label_len = llen - 2;
+    case CMD_GET: {
+        if (data_len < 2) { resp_err(writer, wctx, "bad get body"); return 0; }
+        unsigned char mode  = (unsigned char)data[0];
+        unsigned char shape = (unsigned char)data[1];
+        int *match_ids = NULL;
+        int match_count = 0;
+        int allocated = 0;
+        int single_id_buf;
+
+        if (mode == GET_MODE_SINGLE) {
+            if (label_len > 0) {
+                if (data_len != 2) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+                match_count = resolve_label_all(label, label_len, &match_ids);
+                if (match_count == 0) { resp_err(writer, wctx, "label not found"); return 0; }
+                allocated = 1;
             } else {
-                label = lstart;
-                label_len = llen;
+                if (data_len != 6) { resp_err(writer, wctx, "bad get body"); return 0; }
+                memcpy(&single_id_buf, data + 2, 4);
+                if (single_id_buf < 0 || single_id_buf >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+                if (!g_alive[single_id_buf]) { resp_err(writer, wctx, "deleted"); return 0; }
+                match_ids = &single_id_buf;
+                match_count = 1;
             }
+        } else if (mode == GET_MODE_BATCH) {
+            if (data_len < 6) { resp_err(writer, wctx, "bad batch body"); return 0; }
+            unsigned int n;
+            memcpy(&n, data + 2, 4);
+            if (data_len != (int)(2 + 4 + n * 4)) { resp_err(writer, wctx, "bad batch length"); return 0; }
+            const int *src = (const int *)(data + 6);
+            for (unsigned int i = 0; i < n; i++) {
+                if (src[i] < 0 || src[i] >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+                if (!g_alive[src[i]]) { resp_err(writer, wctx, "deleted"); return 0; }
+            }
+            match_ids = (int *)src;
+            match_count = (int)n;
+        } else {
+            resp_err(writer, wctx, "bad mode");
+            return 0;
         }
-        float *vals = (float *)malloc(expected_bytes);
-        memcpy(vals, bin_payload, expected_bytes);
-        int slot = vec_push(vals);
-        free(vals);
-        if (label_len > 0) vec_set_label(slot, label, label_len);
-        rlen = snprintf(resp, sizeof(resp), "%d\n", slot);
-        writer(wctx, resp, rlen);
+
+        unsigned int blen;
+        char *body = build_result_body(match_ids, NULL, match_count, shape, 0, &blen);
+        if (allocated) free(match_ids);
+        if (!body) { resp_err(writer, wctx, "out of memory"); return 0; }
+        resp_ok_header(writer, wctx, blen);
+        writer(wctx, body, (int)blen);
+        free(body);
         return 0;
     }
 
-    /* pull (L2 text), cpull (cosine text) */
-    int pull_mode = -1;
-    int pull_offset = 0;
-    if (line_len > 5 && strncmp(line, "pull ", 5) == 0) { pull_mode = 0; pull_offset = 5; }
-    else if (line_len > 6 && strncmp(line, "cpull ", 6) == 0) { pull_mode = 1; pull_offset = 6; }
-    if (pull_mode >= 0) {
-        float *vals = (float *)malloc(g_dim * sizeof(float));
-        int n = parse_floats(line + pull_offset, vals, g_dim);
-        if (n != g_dim) {
-            rlen = snprintf(resp, sizeof(resp), "err dim mismatch: got %d, expected %d\n", n, g_dim);
-            writer(wctx, resp, rlen);
-            free(vals);
-            return 0;
+    case CMD_UPDATE: {
+        int expected = g_dim * (int)sizeof(float);
+        int idx;
+        const float *vec_data;
+        if (label_len > 0) {
+            if (data_len != expected) { resp_err(writer, wctx, "bad body length"); return 0; }
+            idx = resolve_label(label, label_len);
+            if (idx == -2) { resp_err(writer, wctx, "ambiguous label"); return 0; }
+            if (idx < 0) { resp_err(writer, wctx, "label not found"); return 0; }
+            vec_data = (const float *)data;
+        } else {
+            if (data_len != 4 + expected) { resp_err(writer, wctx, "bad body length"); return 0; }
+            memcpy(&idx, data, 4);
+            vec_data = (const float *)(data + 4);
         }
-        int ids[TOP_K];
-        float dists[TOP_K];
-        int k = vec_pull(vals, ids, dists, pull_mode);
-        free(vals);
-        format_results(ids, dists, k, writer, wctx);
+        if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+        if (!g_alive[idx]) { resp_err(writer, wctx, "deleted"); return 0; }
+        upload_and_store(vec_data, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim);
+        g_dirty = 1;
+        resp_ok_empty(writer, wctx);
         return 0;
     }
 
-    /* bpull (L2 binary), bcpull (cosine binary) */
-    int bpull_mode = -1;
-    if (line_len >= 5 && strncmp(line, "bpull", 5) == 0 && (line_len == 5 || line[5] == '\r')) bpull_mode = 0;
-    else if (line_len >= 6 && strncmp(line, "bcpull", 6) == 0 && (line_len == 6 || line[6] == '\r')) bpull_mode = 1;
-    if (bpull_mode >= 0) {
-        int expected_bytes = g_dim * (int)sizeof(float);
-        if (bin_payload_len != expected_bytes) {
-            rlen = snprintf(resp, sizeof(resp), "err need %d bytes, got %d\n", expected_bytes, bin_payload_len);
-            writer(wctx, resp, rlen);
-            return 0;
+    case CMD_DELETE: {
+        int idx;
+        if (label_len > 0) {
+            if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+            idx = resolve_label(label, label_len);
+            if (idx == -2) { resp_err(writer, wctx, "ambiguous label"); return 0; }
+            if (idx < 0) { resp_err(writer, wctx, "label not found"); return 0; }
+        } else {
+            if (data_len != 4) { resp_err(writer, wctx, "bad body length"); return 0; }
+            memcpy(&idx, data, 4);
         }
-        float *vals = (float *)malloc(expected_bytes);
-        memcpy(vals, bin_payload, expected_bytes);
-        int ids[TOP_K];
-        float dists[TOP_K];
-        int k = vec_pull(vals, ids, dists, bpull_mode);
-        free(vals);
-        format_results(ids, dists, k, writer, wctx);
-        return 0;
-    }
-
-    /* label <index> <string> */
-    /* label <index> ["quoted"|unquoted] */
-    if (line_len > 6 && strncmp(line, "label ", 6) == 0) {
-        const char *p = line + 6;
-        int idx = atoi(p);
-        while (*p && *p != ' ') p++;
-        if (*p == ' ') p++;
-        int lbl_len = (int)(line + line_len - p);
-        if (idx < 0 || idx >= g_count) {
-            rlen = snprintf(resp, sizeof(resp), "err index out of range\n");
-            writer(wctx, resp, rlen);
-            return 0;
-        }
-        if (lbl_len >= 2 && p[0] == '"' && p[lbl_len - 1] == '"') { p++; lbl_len -= 2; }
-        vec_set_label(idx, lbl_len > 0 ? p : NULL, lbl_len);
-        rlen = snprintf(resp, sizeof(resp), "ok\n");
-        writer(wctx, resp, rlen);
-        return 0;
-    }
-
-    if (line_len > 7 && strncmp(line, "delete ", 7) == 0) {
-        int idx = atoi(line + 7);
-        if (idx < 0 || idx >= g_count) {
-            rlen = snprintf(resp, sizeof(resp), "err index out of range\n");
-            writer(wctx, resp, rlen);
-            return 0;
-        }
-        if (!g_alive[idx]) {
-            rlen = snprintf(resp, sizeof(resp), "err already deleted\n");
-            writer(wctx, resp, rlen);
-            return 0;
-        }
+        if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+        if (!g_alive[idx]) { resp_err(writer, wctx, "already deleted"); return 0; }
         g_alive[idx] = 0;
         g_deleted++;
-        rlen = snprintf(resp, sizeof(resp), "ok\n");
-        writer(wctx, resp, rlen);
+        g_dirty = 1;
+        if (idx < g_labels_cap) { free(g_labels[idx]); g_labels[idx] = NULL; }
+        if (idx < g_blobs_cap)  { free(g_blobs[idx]); g_blobs[idx] = NULL; g_blob_lens[idx] = 0; }
+        resp_ok_empty(writer, wctx);
         return 0;
     }
 
-    if (line_len >= 4 && strncmp(line, "undo", 4) == 0) {
-        if (g_count == 0) {
-            rlen = snprintf(resp, sizeof(resp), "err empty\n");
-            writer(wctx, resp, rlen);
-            return 0;
+    case CMD_LABEL: {
+        if (data_len != 4) { resp_err(writer, wctx, "bad body length"); return 0; }
+        int idx;
+        memcpy(&idx, data, 4);
+        if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+        if (label_len > 0) {
+            int rc = vec_set_label(idx, label, label_len);
+            if (rc == -1) { resp_err(writer, wctx, "label has invalid chars"); return 0; }
+            if (rc == -2) { resp_err(writer, wctx, "label too long"); return 0; }
+            if (rc == -3) { resp_err(writer, wctx, "label empty"); return 0; }
+        } else {
+            vec_set_label(idx, NULL, 0);
         }
+        g_dirty = 1;
+        resp_ok_empty(writer, wctx);
+        return 0;
+    }
+
+    case CMD_UNDO: {
+        if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+        if (g_count == 0) { resp_err(writer, wctx, "empty"); return 0; }
         g_count--;
         if (!g_alive[g_count]) g_deleted--;
         g_alive[g_count] = 1;
+        g_dirty = 1;
         vec_set_label(g_count, NULL, 0);
-        rlen = snprintf(resp, sizeof(resp), "ok\n");
-        writer(wctx, resp, rlen);
+        vec_set_blob(g_count, NULL, 0);
+        resp_ok_empty(writer, wctx);
         return 0;
     }
 
-    if (line_len >= 4 && strncmp(line, "save", 4) == 0) {
+    case CMD_SAVE: {
+        if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
         save_to_file();
-        rlen = snprintf(resp, sizeof(resp), "ok\n");
-        writer(wctx, resp, rlen);
+        char body[8];
+        unsigned int saved = (unsigned int)g_count;
+        unsigned int crc   = (unsigned int)g_loaded_crc;
+        memcpy(body, &saved, 4);
+        memcpy(body + 4, &crc, 4);
+        resp_ok_header(writer, wctx, 8);
+        writer(wctx, body, 8);
         return 0;
     }
 
-    if (line_len >= 4 && strncmp(line, "size", 4) == 0) {
-        rlen = snprintf(resp, sizeof(resp), "%d\n", g_count);
-        writer(wctx, resp, rlen);
+    case CMD_INFO: {
+        if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+        long long mtime = 0;
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA fattr;
+        if (GetFileAttributesExA(g_filepath, GetFileExInfoStandard, &fattr)) {
+            ULARGE_INTEGER ull;
+            ull.LowPart = fattr.ftLastWriteTime.dwLowDateTime;
+            ull.HighPart = fattr.ftLastWriteTime.dwHighDateTime;
+            mtime = (long long)((ull.QuadPart - 116444736000000000ULL) / 10000000ULL);
+        }
+#else
+        struct stat st;
+        if (stat(g_filepath, &st) == 0) mtime = (long long)st.st_mtime;
+#endif
+        unsigned int name_len = (unsigned int)strlen(g_name);
+        unsigned int blen = 4 + 4 + 4 + 1 + 8 + 4 + 1 + 4 + name_len + 1;
+        char *body = (char *)malloc(blen);
+        if (!body) { resp_err(writer, wctx, "out of memory"); return 0; }
+        char *p = body;
+        memcpy(p, &g_dim, 4); p += 4;
+        memcpy(p, &g_count, 4); p += 4;
+        memcpy(p, &g_deleted, 4); p += 4;
+        *p++ = (char)g_fmt;
+        memcpy(p, &mtime, 8); p += 8;
+        memcpy(p, &g_loaded_crc, 4); p += 4;
+        *p++ = (char)g_crc_ok;
+        memcpy(p, &name_len, 4); p += 4;
+        memcpy(p, g_name, name_len); p += name_len;
+        *p++ = (char)PROTOCOL_VERSION;
+        resp_ok_header(writer, wctx, blen);
+        writer(wctx, body, (int)blen);
+        free(body);
         return 0;
     }
 
-    if (line_len >= 3 && strncmp(line, "dim", 3) == 0) {
-        rlen = snprintf(resp, sizeof(resp), "%d\n", g_dim);
-        writer(wctx, resp, rlen);
+    case CMD_CLUSTER: {
+        if (data_len != 9) { resp_err(writer, wctx, "bad body length"); return 0; }
+        float eps; memcpy(&eps, data, 4);
+        unsigned char mode = (unsigned char)data[4];
+        int min_pts; memcpy(&min_pts, data + 5, 4);
+        if (eps <= 0.0f) { resp_err(writer, wctx, "invalid eps"); return 0; }
+        if (mode > METRIC_COSINE) { resp_err(writer, wctx, "bad metric"); return 0; }
+        if (min_pts < 1) min_pts = 1;
+        scratch_writer_ctx sctx; scratch_writer_init(&sctx);
+        vec_cluster(eps, min_pts, mode, scratch_writer_fn, &sctx);
+        resp_ok_header(writer, wctx, sctx.len);
+        if (sctx.len > 0) writer(wctx, sctx.buf, (int)sctx.len);
+        scratch_writer_free(&sctx);
         return 0;
     }
 
-    rlen = snprintf(resp, sizeof(resp), "err unknown command\n");
-    writer(wctx, resp, rlen);
-    return 0;
+    case CMD_DISTINCT: {
+        resp_err(writer, wctx, "distinct not available in cpu mode");
+        return 0;
+    }
+
+    case CMD_REPRESENT: {
+        resp_err(writer, wctx, "represent not available in cpu mode");
+        return 0;
+    }
+
+    case CMD_SET_DATA: {
+        int idx;
+        unsigned int dlen;
+        const unsigned char *bytes;
+        if (label_len > 0) {
+            if (data_len < 4) { resp_err(writer, wctx, "bad body length"); return 0; }
+            memcpy(&dlen, data, 4);
+            if (data_len != (int)(4 + dlen)) { resp_err(writer, wctx, "bad body length"); return 0; }
+            idx = resolve_label(label, label_len);
+            if (idx == -2) { resp_err(writer, wctx, "ambiguous label"); return 0; }
+            if (idx < 0) { resp_err(writer, wctx, "label not found"); return 0; }
+            bytes = (const unsigned char *)(data + 4);
+        } else {
+            if (data_len < 8) { resp_err(writer, wctx, "bad body length"); return 0; }
+            memcpy(&idx, data, 4);
+            memcpy(&dlen, data + 4, 4);
+            if (data_len != (int)(8 + dlen)) { resp_err(writer, wctx, "bad body length"); return 0; }
+            bytes = (const unsigned char *)(data + 8);
+        }
+        if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+        if (!g_alive[idx]) { resp_err(writer, wctx, "deleted"); return 0; }
+        if (dlen > MAX_DATA_BYTES) { resp_err(writer, wctx, "data too large"); return 0; }
+        int rc = vec_set_blob(idx, dlen > 0 ? bytes : NULL, dlen);
+        if (rc != 0) { resp_err(writer, wctx, "data store failed"); return 0; }
+        g_dirty = 1;
+        resp_ok_empty(writer, wctx);
+        return 0;
+    }
+
+    case CMD_GET_DATA: {
+        int idx;
+        if (label_len > 0) {
+            if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
+            idx = resolve_label(label, label_len);
+            if (idx == -2) { resp_err(writer, wctx, "ambiguous label"); return 0; }
+            if (idx < 0) { resp_err(writer, wctx, "label not found"); return 0; }
+        } else {
+            if (data_len != 4) { resp_err(writer, wctx, "bad body length"); return 0; }
+            memcpy(&idx, data, 4);
+        }
+        if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
+        if (!g_alive[idx]) { resp_err(writer, wctx, "deleted"); return 0; }
+        unsigned int dlen = (idx < g_blobs_cap && g_blobs[idx]) ? g_blob_lens[idx] : 0;
+        resp_ok_header(writer, wctx, 4 + dlen);
+        writer(wctx, (const char *)&dlen, 4);
+        if (dlen > 0) writer(wctx, (const char *)g_blobs[idx], (int)dlen);
+        return 0;
+    }
+
+    default:
+        resp_err(writer, wctx, "unknown binary command");
+        return 0;
+    }
 }
+
 
 /* ===================================================================== */
 /*  Argument parsing (shared)                                            */
@@ -889,7 +1509,7 @@ static void print_startup_info(int file_exists, int loaded, double max_records) 
     printf("===================================================================\n");
 
     if (file_exists && loaded > 0) {
-        char cnt[32], active[32], del[32], cap[32], rem[32], fsz[32], ago[64];
+        char cnt[32], active[32], del[32], cap[32], rem[32], fsz[32];
         int alive = g_count - g_deleted;
         double remaining = max_records - g_count;
         double avail = (remaining / max_records) * 100.0;
@@ -938,12 +1558,14 @@ static void print_startup_info(int file_exists, int loaded, double max_records) 
             printf("  checksum      MISMATCH - expected 0x%08X, got 0x%08X\n", g_loaded_crc, g_computed_crc);
         else
             printf("  checksum      none (old format)\n");
+
     } else {
         char cap[32];
         fmt_count(cap, sizeof(cap), (int)max_records);
         printf("  database      %s (new)\n", g_name);
         printf("  format        %s, %d dim\n", fmt_name(g_fmt), g_dim);
         printf("  capacity      %s records max\n", cap);
+
     }
 
     printf("===================================================================\n");
@@ -954,33 +1576,238 @@ static void print_startup_info(int file_exists, int loaded, double max_records) 
 /* ===================================================================== */
 
 static void print_help() {
-    printf("vec - dead simple GPU-resident vector database\n\n");
-    printf("usage:\n");
-    printf("  vec                              auto-detect or create new db\n");
-    printf("  vec <name> [dim[:fmt]] [port]    create/open database\n");
-    printf("  vec <file.tensors> [port]        load from file\n");
-    printf("  vec --notcp <name> [dim] [port]  run without TCP (pipe/socket only)\n");
-    printf("  vec --route <port>               router mode (forward TCP to pipes)\n");
-    printf("  vec --help                       this message\n\n");
-    printf("protocol:\n");
-    printf("  push [label] <floats>            store vector with optional label\n");
-    printf("  bpush [label]\\n<bytes>           binary push (raw fp32)\n");
-    printf("  pull <floats>                    query L2 distance\n");
-    printf("  cpull <floats>                   query cosine distance\n");
-    printf("  bpull\\n<bytes>                   binary L2 query\n");
-    printf("  bcpull\\n<bytes>                  binary cosine query\n");
-    printf("  label <idx> <string>             set/override label\n");
-    printf("  delete <idx>                     tombstone vector\n");
-    printf("  undo                             remove last push\n");
-    printf("  save                             flush to disk\n");
-    printf("  size                             total record count\n");
-    printf("  dim                              vector dimension\n\n");
-    printf("router mode:\n");
-    printf("  start instances with --notcp, then route them through one port:\n");
-    printf("  vec --notcp tools 1024\n");
-    printf("  vec --notcp conversations 1024\n");
-    printf("  vec --route 1920\n");
-    printf("  client sends: push tools 0.12,...\\n\n");
+    printf("vec-cpu - dead simple memory-resident vector database (no GPU needed)\n\n");
+    printf("start a database:\n");
+    printf("  vec-cpu                              find .tensors in current dir or create new\n");
+    printf("  vec-cpu mydb 1024                    create/open 1024-dim database\n");
+    printf("  vec-cpu mydb 1024 1921               custom port\n");
+    printf("  vec-cpu mydb 1024 --topk=50          return top 50 results (default 25, max 100)\n");
+    printf("  vec-cpu mydb.tensors                 load from file\n\n");
+    printf("binary frame protocol (0xF0 prefix, only interface):\n");
+    printf("  format: F0 <2B ns_len> [ns] <CMD> <2B label_len> [label] [data]\n");
+    printf("  CMD: 01=push 02=pull 03=cpull 04=get 05=mget 06=update\n");
+    printf("       07=delete 08=label 09=undo 0A=save 0D=cluster 10=info\n\n");
+    printf("multiple databases:\n");
+    printf("  vec-cpu deploy                       auto-discover .tensors, launch all\n");
+    printf("  vec-cpu --deploy=a:1024,b:512 1920   explicit schema, custom port\n");
+    printf("  vec-cpu --notcp tools 1024           pipe/socket only (no TCP)\n");
+    printf("  vec-cpu --route 1920                 route multiple --notcp instances\n\n");
+    printf("housekeeping:\n");
+    printf("  vec-cpu mydb --delete                destroy database files\n");
+    printf("  vec-cpu mydb --check                 verify file integrity (dry run)\n");
+    printf("  vec-cpu mydb --repair                verify and fix file integrity\n");
+    printf("  vec-cpu --help                       this message\n\n");
+}
+
+/* ===================================================================== */
+/*  File repair                                                          */
+/* ===================================================================== */
+
+static int run_repair(int dry_run) {
+    FILE *f = fopen(g_filepath, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: cannot open %s\n", g_filepath);
+        return 1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    int file_dim, file_count, file_deleted;
+    unsigned char file_fmt;
+    if (fread(&file_dim, sizeof(int), 1, f) != 1 ||
+        fread(&file_count, sizeof(int), 1, f) != 1 ||
+        fread(&file_deleted, sizeof(int), 1, f) != 1 ||
+        fread(&file_fmt, 1, 1, f) != 1) {
+        fclose(f);
+        fprintf(stderr, "ERROR: cannot read header - file corrupt\n");
+        return 1;
+    }
+
+    int elem_size = (file_fmt == FMT_F16) ? 2 : 4;
+    long long header_bytes = 13;
+    long long mask_bytes = file_count;
+    long long vec_bytes = (long long)file_count * file_dim * elem_size;
+    long long expected_size = header_bytes + mask_bytes + vec_bytes + 4;
+
+    printf("file:       %s\n", g_filepath);
+    printf("size:       %lld bytes\n", file_size);
+    printf("format:     %s, %d dim\n", file_fmt == FMT_F16 ? "f16" : "f32", file_dim);
+    printf("header:     %d total, %d deleted, %d alive\n", file_count, file_deleted, file_count - file_deleted);
+    printf("expected:   %lld bytes\n", expected_size);
+
+    if (file_size < header_bytes + mask_bytes) {
+        fclose(f);
+        fprintf(stderr, "\nERROR: file too small - alive mask incomplete, cannot repair\n");
+        return 1;
+    }
+
+    unsigned char *alive = (unsigned char *)malloc(file_count);
+    size_t mask_rd = fread(alive, 1, file_count, f);
+    if ((int)mask_rd != file_count) {
+        fclose(f);
+        free(alive);
+        fprintf(stderr, "\nERROR: alive mask truncated (%d of %d bytes)\n", (int)mask_rd, file_count);
+        return 1;
+    }
+
+    long long data_avail = file_size - header_bytes - mask_bytes;
+    int stride = file_dim * elem_size;
+    int full_vectors = (int)(data_avail / stride);
+    int has_crc = 0;
+
+    if (data_avail >= (long long)file_count * stride + 4) {
+        full_vectors = file_count;
+        has_crc = 1;
+    } else if (data_avail >= (long long)file_count * stride) {
+        full_vectors = file_count;
+        long long leftover = data_avail - (long long)file_count * stride;
+        has_crc = (leftover >= 4) ? 1 : 0;
+    } else {
+        full_vectors = (int)(data_avail / stride);
+    }
+
+    int truncated = file_count - full_vectors;
+    printf("vectors:    %d readable, %d truncated\n", full_vectors, truncated);
+
+    unsigned int crc = 0;
+    crc = crc32_update(crc, alive, file_count);
+
+    int nan_count = 0;
+    int *nan_indices = NULL;
+    size_t total_data = (size_t)full_vectors * stride;
+    void *vec_data = malloc(total_data);
+    size_t rd = fread(vec_data, 1, total_data, f);
+    crc = crc32_update(crc, vec_data, rd);
+
+    for (int i = 0; i < full_vectors; i++) {
+        if (!alive[i]) continue;
+        int bad = 0;
+        if (file_fmt == FMT_F32) {
+            float *v = (float *)((char *)vec_data + (size_t)i * stride);
+            for (int d = 0; d < file_dim; d++) {
+                unsigned int bits; memcpy(&bits, &v[d], 4);
+                unsigned int exp = (bits >> 23) & 0xFF;
+                if (exp == 0xFF) { bad = 1; break; }
+            }
+        } else {
+            unsigned short *v = (unsigned short *)((char *)vec_data + (size_t)i * stride);
+            for (int d = 0; d < file_dim; d++) {
+                unsigned short exp = (v[d] >> 10) & 0x1F;
+                if (exp == 0x1F) { bad = 1; break; }
+            }
+        }
+        if (bad) {
+            nan_indices = (int *)realloc(nan_indices, (nan_count + 1) * sizeof(int));
+            nan_indices[nan_count++] = i;
+        }
+    }
+
+    unsigned int stored_crc = 0;
+    int crc_present = 0;
+    if (has_crc && fread(&stored_crc, sizeof(unsigned int), 1, f) == 1) {
+        crc_present = 1;
+    }
+
+    fclose(f);
+
+    printf("CRC:        ");
+    if (crc_present) {
+        if (stored_crc == crc)
+            printf("0x%08X - ok\n", stored_crc);
+        else
+            printf("MISMATCH - stored 0x%08X, computed 0x%08X\n", stored_crc, crc);
+    } else {
+        printf("missing (old format or truncated)\n");
+    }
+
+    printf("bad vectors: %d (NaN/Inf in alive entries)\n", nan_count);
+
+    int issues = truncated + nan_count + (crc_present && stored_crc != crc ? 1 : 0) + (!crc_present ? 1 : 0);
+
+    if (issues == 0) {
+        printf("\nfile is healthy, no repairs needed\n");
+        free(alive);
+        free(vec_data);
+        free(nan_indices);
+        return 0;
+    }
+
+    printf("\nissues found:\n");
+    if (truncated > 0)
+        printf("  - %d vectors truncated (indices %d..%d have no data)\n", truncated, full_vectors, file_count - 1);
+    if (nan_count > 0) {
+        printf("  - %d vectors contain NaN/Inf:", nan_count);
+        for (int i = 0; i < nan_count && i < 20; i++) printf(" %d", nan_indices[i]);
+        if (nan_count > 20) printf(" ... (%d more)", nan_count - 20);
+        printf("\n");
+    }
+    if (!crc_present)
+        printf("  - CRC trailer missing\n");
+    else if (stored_crc != crc)
+        printf("  - CRC mismatch\n");
+
+    if (dry_run) {
+        printf("\ndry run - no changes made. use --repair to fix.\n");
+        free(alive);
+        free(vec_data);
+        free(nan_indices);
+        return (issues > 0) ? 1 : 0;
+    }
+
+    printf("\nrepairing...\n");
+
+    int repaired = 0;
+
+    for (int i = 0; i < nan_count; i++) {
+        int idx = nan_indices[i];
+        if (alive[idx]) {
+            alive[idx] = 0;
+            file_deleted++;
+            repaired++;
+            printf("  tombstoned index %d (bad embedding)\n", idx);
+        }
+    }
+
+    if (truncated > 0) {
+        printf("  adjusted count %d -> %d (%d truncated entries removed)\n", file_count, full_vectors, truncated);
+        file_count = full_vectors;
+    }
+
+    FILE *fw = fopen(g_filepath, "wb");
+    if (!fw) {
+        fprintf(stderr, "ERROR: cannot open %s for writing\n", g_filepath);
+        free(alive); free(vec_data); free(nan_indices);
+        return 1;
+    }
+
+    fwrite(&file_dim, sizeof(int), 1, fw);
+    fwrite(&file_count, sizeof(int), 1, fw);
+    fwrite(&file_deleted, sizeof(int), 1, fw);
+    unsigned char fmt_byte = (unsigned char)file_fmt;
+    fwrite(&fmt_byte, 1, 1, fw);
+
+    unsigned int new_crc = 0;
+    fwrite(alive, 1, file_count, fw);
+    new_crc = crc32_update(new_crc, alive, file_count);
+
+    size_t write_bytes = (size_t)file_count * stride;
+    fwrite(vec_data, 1, write_bytes, fw);
+    new_crc = crc32_update(new_crc, vec_data, write_bytes);
+
+    fwrite(&new_crc, sizeof(unsigned int), 1, fw);
+    fclose(fw);
+
+    char crc_name[16];
+    crc32_word(new_crc, crc_name);
+    printf("\nrepaired: %d issue(s) fixed, %d vectors, checksum %s (0x%08X)\n",
+           repaired + (truncated > 0 ? 1 : 0), file_count, crc_name, new_crc);
+
+    free(alive);
+    free(vec_data);
+    free(nan_indices);
+    return 0;
 }
 
 /* ===================================================================== */
@@ -1002,12 +1829,6 @@ struct route_entry {
 
 static route_entry g_routes[MAX_ROUTES];
 static int g_route_count = 0;
-
-static int router_is_binary(const char *cmd, int cmd_len) {
-    return (cmd_len >= 5 && strncmp(cmd, "bpush", 5) == 0) ||
-           (cmd_len >= 5 && strncmp(cmd, "bpull", 5) == 0) ||
-           (cmd_len >= 6 && strncmp(cmd, "bcpull", 6) == 0);
-}
 
 #ifdef _WIN32
 
@@ -1064,22 +1885,6 @@ static int router_send_recv(route_entry *r, const char *data, int data_len,
     return total;
 }
 
-static void router_query_dim(route_entry *r) {
-    char resp[64];
-    int rlen = router_send_recv(r, "dim\n", 4, NULL, 0, resp, sizeof(resp));
-    if (rlen > 0) r->dim = atoi(resp);
-}
-
-static int router_recv_exact(SOCKET s, char *buf, int need) {
-    int got = 0;
-    while (got < need) {
-        int r = recv(s, buf + got, need - got, 0);
-        if (r <= 0) return -1;
-        got += r;
-    }
-    return got;
-}
-
 static DWORD WINAPI router_client_thread(LPVOID param) {
     SOCKET client = *(SOCKET *)param;
     free(param);
@@ -1091,90 +1896,113 @@ static DWORD WINAPI router_client_thread(LPVOID param) {
         buf_used += r;
         buf[buf_used] = '\0';
         while (1) {
-            char *nl = (char *)memchr(buf, '\n', buf_used);
-            if (!nl) break;
-            int line_len = (int)(nl - buf);
-            /* parse: command namespace [args...] */
-            int cmd_len = 0;
-            while (cmd_len < line_len && buf[cmd_len] != ' ') cmd_len++;
-            const char *ns_start = buf + cmd_len + 1;
-            int ns_len = 0;
-            while (cmd_len + 1 + ns_len < line_len && ns_start[ns_len] != ' ') ns_len++;
+            if (buf_used < 1) break;
+
+            if ((unsigned char)buf[0] != BIN_MAGIC) {
+                int skip = 1;
+                while (skip < buf_used && (unsigned char)buf[skip] != BIN_MAGIC) skip++;
+                buf_used -= skip;
+                if (buf_used > 0) memmove(buf, buf + skip, buf_used);
+                continue;
+            }
+
+            /* binary frame: extract namespace from frame, forward with ns_len=0 */
+            if (buf_used < 3) break;
+            unsigned short frame_ns_len; memcpy(&frame_ns_len, buf + 1, 2);
+            int hdr = 3 + frame_ns_len;
+            if (buf_used < hdr + 3) break;
+            unsigned char cmd = (unsigned char)buf[hdr];
+            unsigned short lbl_len; memcpy(&lbl_len, buf + hdr + 1, 2);
+            int header_total = hdr + 3 + lbl_len + 4; /* +4 for explicit body_len (2.0) */
+            if (buf_used < header_total) break;
+            const char *data_start = buf + hdr + 3 + lbl_len;
+            int available = buf_used - (hdr + 3 + lbl_len);
+            int dlen = frame_data_len(cmd, data_start, available, lbl_len);
+            if (dlen == -1) break;
+            if (dlen == -2) {
+                const char *err = "unknown binary command";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
+                buf_used -= header_total;
+                if (buf_used > 0) memmove(buf, buf + header_total, buf_used);
+                continue;
+            }
+            int frame_total = header_total + dlen;
+            while (buf_used < frame_total) {
+                r = recv(client, buf + buf_used, sizeof(buf) - buf_used, 0);
+                if (r <= 0) goto router_done;
+                buf_used += r;
+            }
+            /* find route from frame namespace */
             route_entry *route = NULL;
-            if (ns_len > 0) {
+            if (frame_ns_len > 0) {
+                const char *ns = buf + 3;
                 for (int i = 0; i < g_route_count; i++) {
-                    if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                    if ((int)strlen(g_routes[i].name) == frame_ns_len && strncmp(g_routes[i].name, ns, frame_ns_len) == 0) { route = &g_routes[i]; break; }
                 }
                 if (!route) {
                     int old_count = g_route_count;
                     router_discover_pipes();
                     for (int i = old_count; i < g_route_count; i++) {
-                        if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                        if ((int)strlen(g_routes[i].name) == frame_ns_len && strncmp(g_routes[i].name, ns, frame_ns_len) == 0) { route = &g_routes[i]; break; }
                     }
                 }
             }
             char resp[65536];
             if (!route) {
-                int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
-                send(client, resp, rlen, 0);
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
+                const char *err = "unknown namespace";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
             } else {
-                if (route->dim == 0) router_query_dim(route);
-                int is_bin = router_is_binary(buf, cmd_len) && route->dim > 0;
-                /* rebuild as: command [args...]\n (strip namespace) */
-                char fwd[65536];
-                int fwd_len = 0;
-                memcpy(fwd, buf, cmd_len);
-                fwd_len = cmd_len;
-                int rest_off = cmd_len + 1 + ns_len;
-                if (rest_off < line_len) {
-                    memcpy(fwd + fwd_len, buf + rest_off, line_len - rest_off);
-                    fwd_len += line_len - rest_off;
-                }
-                fwd[fwd_len] = '\n';
-                fwd_len++;
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (is_bin) {
-                    int payload = route->dim * (int)sizeof(float);
-                    char *bin = (char *)malloc(payload);
-                    int have = (buf_used < payload) ? buf_used : payload;
-                    if (have > 0) memcpy(bin, buf, have);
-                    if (have < payload) {
-                        if (router_recv_exact(client, bin + have, payload - have) < 0) {
-                            free(bin); break;
-                        }
-                    }
-                    buf_used -= have;
-                    if (buf_used > 0) memmove(buf, buf + have, buf_used);
-                    int rlen = router_send_recv(route, fwd, fwd_len, bin, payload, resp, sizeof(resp));
-                    free(bin);
-                    if (rlen > 0) send(client, resp, rlen, 0);
-                    else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
-                } else {
-                    int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
-                    if (rlen > 0) send(client, resp, rlen, 0);
-                    else { int elen = snprintf(resp, sizeof(resp), "err pipe disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                /* rebuild frame with ns_len=0, preserving body_len */
+                int fwd_len = 1 + 2 + 1 + 2 + lbl_len + 4 + dlen;
+                char *fwd = (char *)malloc(fwd_len);
+                char *p = fwd;
+                *p++ = (char)BIN_MAGIC;
+                unsigned short zero_ns = 0; memcpy(p, &zero_ns, 2); p += 2;
+                *p++ = (char)cmd;
+                memcpy(p, &lbl_len, 2); p += 2;
+                if (lbl_len > 0) { memcpy(p, buf + hdr + 3, lbl_len); p += lbl_len; }
+                unsigned int blen_le = (unsigned int)dlen;
+                memcpy(p, &blen_le, 4); p += 4;
+                if (dlen > 0) { memcpy(p, buf + header_total, dlen); p += dlen; }
+                int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
+                free(fwd);
+                if (rlen > 0) send(client, resp, rlen, 0);
+                else {
+                    char ebuf[256]; ebuf[0] = RESP_ERR;
+                    int el = snprintf(ebuf + 5, sizeof(ebuf) - 5, "pipe disconnected '%s'", route->name);
+                    unsigned int elu = (unsigned int)el;
+                    memcpy(ebuf + 1, &elu, 4);
+                    send(client, ebuf, 5 + el, 0);
                 }
             }
+            buf_used -= frame_total;
+            if (buf_used > 0) memmove(buf, buf + frame_total, buf_used);
         }
     }
+router_done:
     closesocket(client);
     return 0;
 }
 
-static int run_router(int port) {
+static int run_router(int port, int from_deploy = 0) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     router_discover_pipes();
-    printf("vec router on port %d\n", port);
-    printf("discovered %d namespace%s:\n", g_route_count, g_route_count == 1 ? "" : "s");
-    for (int i = 0; i < g_route_count; i++) printf("  %s -> \\\\.\\pipe\\vec_%s\n", g_routes[i].name, g_routes[i].name);
-    if (g_route_count == 0) printf("  (none found, will discover on first request)\n");
-    printf("\n");
+    if (!from_deploy) {
+        printf("vec-cpu router on port %d\n", port);
+        printf("discovered %d namespace%s:\n", g_route_count, g_route_count == 1 ? "" : "s");
+        for (int i = 0; i < g_route_count; i++) printf("  %s -> \\\\.\\pipe\\vec_%s\n", g_routes[i].name, g_routes[i].name);
+        if (g_route_count == 0) printf("  (none found, will discover on first request)\n");
+        printf("\n");
+    }
     SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     int opt = 1;
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
@@ -1187,7 +2015,9 @@ static int run_router(int port) {
         fprintf(stderr, "ERROR: cannot bind port %d\n", port); closesocket(listen_sock); WSACleanup(); return 1;
     }
     listen(listen_sock, SOMAXCONN);
-    printf("ready for connections\n");
+    printf("TCP listening on 0.0.0.0:%d\n", port);
+    printf("ready for connections, ctrl+c to exit\n");
+    if (!from_deploy) printf("hint: use --deploy to automate instance spawning and routing\n");
     while (1) {
         SOCKET client = accept(listen_sock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
@@ -1253,22 +2083,6 @@ static int router_send_recv(route_entry *r, const char *data, int data_len,
     return total;
 }
 
-static void router_query_dim(route_entry *r) {
-    char resp[64];
-    int rlen = router_send_recv(r, "dim\n", 4, NULL, 0, resp, sizeof(resp));
-    if (rlen > 0) r->dim = atoi(resp);
-}
-
-static int router_recv_exact(int s, char *buf, int need) {
-    int got = 0;
-    while (got < need) {
-        int r = recv(s, buf + got, need - got, 0);
-        if (r <= 0) return -1;
-        got += r;
-    }
-    return got;
-}
-
 static void *router_client_thread(void *param) {
     int client = *(int *)param;
     free(param);
@@ -1280,88 +2094,111 @@ static void *router_client_thread(void *param) {
         buf_used += r;
         buf[buf_used] = '\0';
         while (1) {
-            char *nl = (char *)memchr(buf, '\n', buf_used);
-            if (!nl) break;
-            int line_len = (int)(nl - buf);
-            /* parse: command namespace [args...] */
-            int cmd_len = 0;
-            while (cmd_len < line_len && buf[cmd_len] != ' ') cmd_len++;
-            const char *ns_start = buf + cmd_len + 1;
-            int ns_len = 0;
-            while (cmd_len + 1 + ns_len < line_len && ns_start[ns_len] != ' ') ns_len++;
+            if (buf_used < 1) break;
+
+            if ((unsigned char)buf[0] != BIN_MAGIC) {
+                int skip = 1;
+                while (skip < buf_used && (unsigned char)buf[skip] != BIN_MAGIC) skip++;
+                buf_used -= skip;
+                if (buf_used > 0) memmove(buf, buf + skip, buf_used);
+                continue;
+            }
+
+            /* binary frame: extract namespace from frame, forward with ns_len=0 */
+            if (buf_used < 3) break;
+            unsigned short frame_ns_len; memcpy(&frame_ns_len, buf + 1, 2);
+            int hdr = 3 + frame_ns_len;
+            if (buf_used < hdr + 3) break;
+            unsigned char cmd = (unsigned char)buf[hdr];
+            unsigned short lbl_len; memcpy(&lbl_len, buf + hdr + 1, 2);
+            int header_total = hdr + 3 + lbl_len + 4; /* +4 for explicit body_len (2.0) */
+            if (buf_used < header_total) break;
+            const char *data_start = buf + hdr + 3 + lbl_len;
+            int available = buf_used - (hdr + 3 + lbl_len);
+            int dlen = frame_data_len(cmd, data_start, available, lbl_len);
+            if (dlen == -1) break;
+            if (dlen == -2) {
+                const char *err = "unknown binary command";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
+                buf_used -= header_total;
+                if (buf_used > 0) memmove(buf, buf + header_total, buf_used);
+                continue;
+            }
+            int frame_total = header_total + dlen;
+            while (buf_used < frame_total) {
+                r = recv(client, buf + buf_used, sizeof(buf) - buf_used, 0);
+                if (r <= 0) goto router_done;
+                buf_used += r;
+            }
+            /* find route from frame namespace */
             route_entry *route = NULL;
-            if (ns_len > 0) {
+            if (frame_ns_len > 0) {
+                const char *ns = buf + 3;
                 for (int i = 0; i < g_route_count; i++) {
-                    if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                    if ((int)strlen(g_routes[i].name) == frame_ns_len && strncmp(g_routes[i].name, ns, frame_ns_len) == 0) { route = &g_routes[i]; break; }
                 }
                 if (!route) {
                     int old_count = g_route_count;
                     router_discover_sockets();
                     for (int i = old_count; i < g_route_count; i++) {
-                        if ((int)strlen(g_routes[i].name) == ns_len && strncmp(g_routes[i].name, ns_start, ns_len) == 0) { route = &g_routes[i]; break; }
+                        if ((int)strlen(g_routes[i].name) == frame_ns_len && strncmp(g_routes[i].name, ns, frame_ns_len) == 0) { route = &g_routes[i]; break; }
                     }
                 }
             }
             char resp[65536];
             if (!route) {
-                int rlen = snprintf(resp, sizeof(resp), "err unknown namespace '%.*s'\n", ns_len, ns_start);
-                send(client, resp, rlen, 0);
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
+                const char *err = "unknown namespace";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
             } else {
-                if (route->dim == 0) router_query_dim(route);
-                int is_bin = router_is_binary(buf, cmd_len) && route->dim > 0;
-                /* rebuild as: command [args...]\n (strip namespace) */
-                char fwd[65536];
-                int fwd_len = 0;
-                memcpy(fwd, buf, cmd_len);
-                fwd_len = cmd_len;
-                int rest_off = cmd_len + 1 + ns_len;
-                if (rest_off < line_len) {
-                    memcpy(fwd + fwd_len, buf + rest_off, line_len - rest_off);
-                    fwd_len += line_len - rest_off;
-                }
-                fwd[fwd_len] = '\n';
-                fwd_len++;
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (is_bin) {
-                    int payload = route->dim * (int)sizeof(float);
-                    char *bin = (char *)malloc(payload);
-                    int have = (buf_used < payload) ? buf_used : payload;
-                    if (have > 0) memcpy(bin, buf, have);
-                    if (have < payload) {
-                        if (router_recv_exact(client, bin + have, payload - have) < 0) {
-                            free(bin); break;
-                        }
-                    }
-                    buf_used -= have;
-                    if (buf_used > 0) memmove(buf, buf + have, buf_used);
-                    int rlen = router_send_recv(route, fwd, fwd_len, bin, payload, resp, sizeof(resp));
-                    free(bin);
-                    if (rlen > 0) send(client, resp, rlen, 0);
-                    else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
-                } else {
-                    int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
-                    if (rlen > 0) send(client, resp, rlen, 0);
-                    else { int elen = snprintf(resp, sizeof(resp), "err socket disconnected '%s'\n", route->name); send(client, resp, elen, 0); }
+                /* rebuild frame with ns_len=0, preserving body_len */
+                int fwd_len = 1 + 2 + 1 + 2 + lbl_len + 4 + dlen;
+                char *fwd = (char *)malloc(fwd_len);
+                char *p = fwd;
+                *p++ = (char)BIN_MAGIC;
+                unsigned short zero_ns = 0; memcpy(p, &zero_ns, 2); p += 2;
+                *p++ = (char)cmd;
+                memcpy(p, &lbl_len, 2); p += 2;
+                if (lbl_len > 0) { memcpy(p, buf + hdr + 3, lbl_len); p += lbl_len; }
+                unsigned int blen_le = (unsigned int)dlen;
+                memcpy(p, &blen_le, 4); p += 4;
+                if (dlen > 0) { memcpy(p, buf + header_total, dlen); p += dlen; }
+                int rlen = router_send_recv(route, fwd, fwd_len, NULL, 0, resp, sizeof(resp));
+                free(fwd);
+                if (rlen > 0) send(client, resp, rlen, 0);
+                else {
+                    char ebuf[256]; ebuf[0] = RESP_ERR;
+                    int el = snprintf(ebuf + 5, sizeof(ebuf) - 5, "socket disconnected '%s'", route->name);
+                    unsigned int elu = (unsigned int)el;
+                    memcpy(ebuf + 1, &elu, 4);
+                    send(client, ebuf, 5 + el, 0);
                 }
             }
+            buf_used -= frame_total;
+            if (buf_used > 0) memmove(buf, buf + frame_total, buf_used);
         }
     }
+router_done:
     close(client);
     return NULL;
 }
 
-static int run_router(int port) {
+static int run_router(int port, int from_deploy = 0) {
     router_discover_sockets();
-    printf("vec router on port %d\n", port);
-    printf("discovered %d namespace%s:\n", g_route_count, g_route_count == 1 ? "" : "s");
-    for (int i = 0; i < g_route_count; i++) printf("  %s -> /tmp/vec_%s.sock\n", g_routes[i].name, g_routes[i].name);
-    if (g_route_count == 0) printf("  (none found, will discover on first request)\n");
-    printf("\n");
+    if (!from_deploy) {
+        printf("vec-cpu router on port %d\n", port);
+        printf("discovered %d namespace%s:\n", g_route_count, g_route_count == 1 ? "" : "s");
+        for (int i = 0; i < g_route_count; i++) printf("  %s -> /tmp/vec_%s.sock\n", g_routes[i].name, g_routes[i].name);
+        if (g_route_count == 0) printf("  (none found, will discover on first request)\n");
+        printf("\n");
+    }
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1374,7 +2211,9 @@ static int run_router(int port) {
         fprintf(stderr, "ERROR: cannot bind port %d\n", port); close(listen_fd); return 1;
     }
     listen(listen_fd, SOMAXCONN);
-    printf("ready for connections\n");
+    printf("TCP listening on 0.0.0.0:%d\n", port);
+    printf("ready for connections, ctrl+c to exit\n");
+    if (!from_deploy) printf("hint: use --deploy to automate instance spawning and routing\n");
     while (1) {
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) continue;
@@ -1388,6 +2227,149 @@ static int run_router(int port) {
 }
 
 #endif
+
+/* ===================================================================== */
+/*  Deploy mode (shared)                                                 */
+/* ===================================================================== */
+
+static void generate_random_name(char *buf, int len); /* defined per-platform */
+
+#define MAX_DEPLOY 32
+
+struct deploy_entry {
+    char name[64];
+    int  dim;
+    char format[8];
+};
+
+static deploy_entry g_deploy[MAX_DEPLOY];
+static int g_deploy_count = 0;
+
+static int parse_deploy(const char *spec) {
+    char buf[2048];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok && g_deploy_count < MAX_DEPLOY) {
+        deploy_entry *e = &g_deploy[g_deploy_count];
+        memset(e, 0, sizeof(*e));
+
+        char *c1 = strchr(tok, ':');
+        if (!c1) {
+            fprintf(stderr, "ERROR: deploy entry '%s' missing dimension (use name:dim)\n", tok);
+            return -1;
+        }
+        int nlen = (int)(c1 - tok);
+        if (nlen <= 0 || nlen >= (int)sizeof(e->name)) {
+            fprintf(stderr, "ERROR: invalid name in deploy entry '%s'\n", tok);
+            return -1;
+        }
+        memcpy(e->name, tok, nlen);
+        e->name[nlen] = '\0';
+
+        char *after_dim = c1 + 1;
+        char *c2 = strchr(after_dim, ':');
+        if (c2) {
+            *c2 = '\0';
+            strncpy(e->format, c2 + 1, sizeof(e->format) - 1);
+        }
+        e->dim = atoi(after_dim);
+        if (e->dim <= 0) {
+            fprintf(stderr, "ERROR: invalid dimension in deploy entry '%s'\n", tok);
+            return -1;
+        }
+        for (int j = 0; j < g_deploy_count; j++) {
+            if (strcmp(g_deploy[j].name, e->name) == 0) {
+                fprintf(stderr, "ERROR: duplicate database name '%s'\n", e->name);
+                return -1;
+            }
+        }
+        g_deploy_count++;
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    return g_deploy_count;
+}
+
+static void write_empty_tensors(deploy_entry *e) {
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s_%d_%s.tensors",
+             e->name, e->dim, (e->format[0] ? e->format : "f32"));
+    FILE *f = fopen(filepath, "wb");
+    if (!f) { fprintf(stderr, "ERROR: cannot create %s\n", filepath); return; }
+    int zero = 0;
+    unsigned char fmt = FMT_F32;
+    fwrite(&e->dim, sizeof(int), 1, f);
+    fwrite(&zero, sizeof(int), 1, f);     /* count */
+    fwrite(&zero, sizeof(int), 1, f);     /* deleted */
+    fwrite(&fmt, 1, 1, f);
+    unsigned int crc = 0;
+    fwrite(&crc, sizeof(unsigned int), 1, f);
+    fclose(f);
+}
+
+static int deploy_wizard(int has_f16) {
+    (void)has_f16;
+
+    printf("=== vec-cpu deploy wizard ===\n\n");
+
+    while (g_deploy_count < MAX_DEPLOY) {
+        deploy_entry *e = &g_deploy[g_deploy_count];
+        memset(e, 0, sizeof(*e));
+        char line[256];
+
+        printf("database #%d\n", g_deploy_count + 1);
+
+    name_retry:
+        printf("  name [random]: ");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0]) {
+            strncpy(e->name, line, sizeof(e->name) - 1);
+        } else {
+            generate_random_name(e->name, 6);
+            printf("  -> %s\n", e->name);
+        }
+        for (int j = 0; j < g_deploy_count; j++) {
+            if (strcmp(g_deploy[j].name, e->name) == 0) {
+                printf("  '%s' already exists, pick another\n", e->name);
+                goto name_retry;
+            }
+        }
+
+        printf("  dim [1024]: ");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+        line[strcspn(line, "\r\n")] = '\0';
+        e->dim = line[0] ? atoi(line) : 1024;
+        if (e->dim <= 0) e->dim = 1024;
+
+        g_deploy_count++;
+        printf("\n");
+
+        if (g_deploy_count >= 2) {
+            printf("add another? (y/n) [n]: ");
+            fflush(stdout);
+            if (!fgets(line, sizeof(line), stdin)) break;
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0] != 'y' && line[0] != 'Y') break;
+            printf("\n");
+        }
+    }
+
+    if (g_deploy_count == 0) return 0;
+
+    printf("\ncreating %d database%s...\n", g_deploy_count, g_deploy_count == 1 ? "" : "s");
+    for (int i = 0; i < g_deploy_count; i++) {
+        write_empty_tensors(&g_deploy[i]);
+        printf("  %s_%d_f32.tensors\n", g_deploy[i].name, g_deploy[i].dim);
+    }
+    printf("\n");
+
+    return g_deploy_count;
+}
 
 /* ######################################################################
  * ##                                                                  ##
@@ -1429,16 +2411,21 @@ static void generate_random_name(char *buf, int len) {
     buf[len] = '\0';
 }
 
+struct db_entry { char name[256]; int dim; int fmt; char filename[512]; long long file_size; };
+
 static int find_any_db() {
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA("*.tensors", &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
 
-    int best_score = -1;
+    db_entry entries[64];
+    int count = 0;
 
     do {
+        if (count >= 64) break;
         char buf[256];
         strncpy(buf, fd.cFileName, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
         char *ext = strstr(buf, ".tensors");
         if (!ext) continue;
         *ext = '\0';
@@ -1455,27 +2442,46 @@ static int find_any_db() {
         int d = atoi(ds + 1);
         if (d <= 0) continue;
 
-        int fv = (strcmp(fs, "f16") == 0) ? FMT_F16 : FMT_F32;
-
-        int score = 0;
-        if (fv == FMT_F32) score += 100;
-        if (d == 1024) score += 50;
-
-        if (score > best_score) {
-            best_score = score;
-            strncpy(g_name, buf, sizeof(g_name) - 1);
-            g_dim = d;
-            if (fv == FMT_F16) { g_fmt = FMT_F16; g_elem_size = 2; }
-            else { g_fmt = FMT_F32; g_elem_size = 4; }
-        }
+        strncpy(entries[count].name, buf, sizeof(entries[count].name) - 1);
+        entries[count].dim = d;
+        entries[count].fmt = (strcmp(fs, "f16") == 0) ? FMT_F16 : FMT_F32;
+        strncpy(entries[count].filename, fd.cFileName, sizeof(entries[count].filename) - 1);
+        LARGE_INTEGER sz;
+        sz.LowPart = fd.nFileSizeLow;
+        sz.HighPart = fd.nFileSizeHigh;
+        entries[count].file_size = sz.QuadPart;
+        count++;
     } while (FindNextFileA(h, &fd));
-
     FindClose(h);
-    if (best_score >= 0) {
-        build_filepath();
-        return 1;
+
+    if (count == 0) return 0;
+
+    int pick = 0;
+    if (count > 1) {
+        printf("databases found:\n");
+        for (int i = 0; i < count; i++) {
+            char sz[32];
+            fmt_bytes(sz, sizeof(sz), (double)entries[i].file_size);
+            printf("  [%d] %s (%d dim, %s, %s)\n", i + 1, entries[i].name,
+                   entries[i].dim, entries[i].fmt == FMT_F16 ? "f16" : "f32", sz);
+        }
+        printf("select [1-%d]: ", count);
+        fflush(stdout);
+        char input[16];
+        if (!fgets(input, sizeof(input), stdin)) return 0;
+        pick = atoi(input) - 1;
+        if (pick < 0 || pick >= count) {
+            fprintf(stderr, "invalid selection\n");
+            return 0;
+        }
     }
-    return 0;
+
+    strncpy(g_name, entries[pick].name, sizeof(g_name) - 1);
+    g_dim = entries[pick].dim;
+    if (entries[pick].fmt == FMT_F16) { g_fmt = FMT_F16; g_elem_size = 2; }
+    else { g_fmt = FMT_F32; g_elem_size = 4; }
+    build_filepath();
+    return 1;
 }
 
 static int find_existing_db(const char *name) {
@@ -1530,6 +2536,43 @@ static int find_existing_db(const char *name) {
     return 0;
 }
 
+static int discover_all_dbs() {
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("*.tensors", &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (g_deploy_count >= MAX_DEPLOY) break;
+        char buf[256];
+        strncpy(buf, fd.cFileName, sizeof(buf) - 1);
+        char *ext = strstr(buf, ".tensors");
+        if (!ext) continue;
+        *ext = '\0';
+
+        char *ls = strrchr(buf, '_');
+        if (!ls) continue;
+        *ls = '\0';
+        const char *fs = ls + 1;
+
+        char *ds = strrchr(buf, '_');
+        if (!ds) continue;
+        *ds = '\0';
+
+        int d = atoi(ds + 1);
+        if (d <= 0) continue;
+
+        deploy_entry *e = &g_deploy[g_deploy_count];
+        memset(e, 0, sizeof(*e));
+        strncpy(e->name, buf, sizeof(e->name) - 1);
+        e->dim = d;
+        if (strcmp(fs, "f16") == 0) strncpy(e->format, "f16", sizeof(e->format) - 1);
+        g_deploy_count++;
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+    return g_deploy_count;
+}
+
 /* ----- TCP (Windows) ------------------------------------------------- */
 
 static int tcp_writer(void *ctx, const char *buf, int len) {
@@ -1550,34 +2593,50 @@ static DWORD WINAPI tcp_client_thread(LPVOID param) {
         buf[buf_used] = '\0';
 
         while (1) {
-            char *nl = (char *)memchr(buf, '\n', buf_used);
-            if (!nl) break;
-            int line_len = (int)(nl - buf);
+            if (buf_used < 1) break;
 
-            int is_binary = (line_len >= 5 && strncmp(buf, "bpush", 5) == 0) ||
-                            (line_len >= 5 && strncmp(buf, "bpull", 5) == 0) ||
-                            (line_len >= 6 && strncmp(buf, "bcpull", 6) == 0);
-            if (is_binary) {
-                int payload_bytes = g_dim * (int)sizeof(float);
-                int header_bytes = line_len + 1;
-                int total_needed = header_bytes + payload_bytes;
-                while (buf_used < total_needed && g_running) {
-                    r = recv(client, buf + buf_used, MAX_LINE - buf_used, 0);
-                    if (r <= 0) goto done;
-                    buf_used += r;
-                }
-                int rc = process_command(buf, line_len, tcp_writer, &client, buf + header_bytes, payload_bytes);
-                int consumed = total_needed;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (rc == 1) goto done;
-            } else {
-                int rc = process_command(buf, line_len, tcp_writer, &client, NULL, 0);
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (rc == 1) goto done;
+            if ((unsigned char)buf[0] != BIN_MAGIC) {
+                int skip = 1;
+                while (skip < buf_used && (unsigned char)buf[skip] != BIN_MAGIC) skip++;
+                buf_used -= skip;
+                if (buf_used > 0) memmove(buf, buf + skip, buf_used);
+                continue;
             }
+
+            /* binary frame */
+            if (buf_used < 3) break;
+            unsigned short ns_len; memcpy(&ns_len, buf + 1, 2);
+            int hdr = 3 + ns_len;
+            if (buf_used < hdr + 3) break;
+            unsigned char cmd = (unsigned char)buf[hdr];
+            unsigned short lbl_len; memcpy(&lbl_len, buf + hdr + 1, 2);
+            int header_total = hdr + 3 + lbl_len + 4; /* +4 for explicit body_len (2.0) */
+            if (buf_used < header_total) break;
+            const char *label = (lbl_len > 0) ? buf + hdr + 3 : NULL;
+            const char *data_start = buf + hdr + 3 + lbl_len;
+            int available = buf_used - (hdr + 3 + lbl_len);
+            int dlen = frame_data_len(cmd, data_start, available, lbl_len);
+            if (dlen == -1) break;
+            if (dlen == -2) {
+                const char *err = "unknown binary command";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
+                buf_used -= header_total;
+                if (buf_used > 0) memmove(buf, buf + header_total, buf_used);
+                continue;
+            }
+            int frame_total = header_total + dlen;
+            while (buf_used < frame_total && g_running) {
+                r = recv(client, buf + buf_used, MAX_LINE - buf_used, 0);
+                if (r <= 0) goto done;
+                buf_used += r;
+            }
+            process_binary_frame(cmd, label, lbl_len, buf + header_total, dlen, tcp_writer, &client);
+            buf_used -= frame_total;
+            if (buf_used > 0) memmove(buf, buf + frame_total, buf_used);
         }
     }
 
@@ -1647,7 +2706,6 @@ static int pipe_writer(void *ctx, const char *buf, int len) {
     HANDLE pipe = *(HANDLE *)ctx;
     DWORD written;
     WriteFile(pipe, buf, len, &written, NULL);
-    FlushFileBuffers(pipe);
     return (int)written;
 }
 
@@ -1698,34 +2756,48 @@ static DWORD WINAPI pipe_listener_thread(LPVOID param) {
             buf[buf_used] = '\0';
 
             while (1) {
-                char *nl = (char *)memchr(buf, '\n', buf_used);
-                if (!nl) break;
-                int line_len = (int)(nl - buf);
+                if (buf_used < 1) break;
 
-                int is_binary = (line_len >= 5 && strncmp(buf, "bpush", 5) == 0) ||
-                                (line_len >= 5 && strncmp(buf, "bpull", 5) == 0) ||
-                                (line_len >= 6 && strncmp(buf, "bcpull", 6) == 0);
-                if (is_binary) {
-                    int payload_bytes = g_dim * (int)sizeof(float);
-                    int header_bytes = line_len + 1;
-                    int total_needed = header_bytes + payload_bytes;
-                    while (buf_used < total_needed && g_running) {
-                        ok = ReadFile(pipe, buf + buf_used, MAX_LINE - buf_used, &bytesRead, NULL);
-                        if (!ok || bytesRead == 0) goto pipe_done;
-                        buf_used += (int)bytesRead;
-                    }
-                    int rc = process_command(buf, line_len, pipe_writer, &pipe, buf + header_bytes, payload_bytes);
-                    int consumed = total_needed;
-                    buf_used -= consumed;
-                    if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                    if (rc == 1) goto pipe_done;
-                } else {
-                    int rc = process_command(buf, line_len, pipe_writer, &pipe, NULL, 0);
-                    int consumed = line_len + 1;
-                    buf_used -= consumed;
-                    if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                    if (rc == 1) goto pipe_done;
+                if ((unsigned char)buf[0] != BIN_MAGIC) {
+                    buf_used--;
+                    if (buf_used > 0) memmove(buf, buf + 1, buf_used);
+                    continue;
                 }
+
+                /* binary frame */
+                if (buf_used < 3) break;
+                unsigned short ns_len; memcpy(&ns_len, buf + 1, 2);
+                int hdr = 3 + ns_len;
+                if (buf_used < hdr + 3) break;
+                unsigned char cmd = (unsigned char)buf[hdr];
+                unsigned short lbl_len; memcpy(&lbl_len, buf + hdr + 1, 2);
+                int header_total = hdr + 3 + lbl_len + 4; /* +4 for explicit body_len (2.0) */
+                if (buf_used < header_total) break;
+                const char *label = (lbl_len > 0) ? buf + hdr + 3 : NULL;
+                const char *data_start = buf + hdr + 3 + lbl_len;
+                int available = buf_used - (hdr + 3 + lbl_len);
+                int dlen = frame_data_len(cmd, data_start, available, lbl_len);
+                if (dlen == -1) break;
+                if (dlen == -2) {
+                    const char *err = "unknown binary command";
+                    char ebuf[64]; ebuf[0] = RESP_ERR;
+                    unsigned int el = (unsigned int)strlen(err);
+                    memcpy(ebuf + 1, &el, 4);
+                    memcpy(ebuf + 5, err, el);
+                    pipe_writer(&pipe, ebuf, 5 + (int)el);
+                    buf_used -= header_total;
+                    if (buf_used > 0) memmove(buf, buf + header_total, buf_used);
+                    continue;
+                }
+                int frame_total = header_total + dlen;
+                while (buf_used < frame_total && g_running) {
+                    ok = ReadFile(pipe, buf + buf_used, MAX_LINE - buf_used, &bytesRead, NULL);
+                    if (!ok || bytesRead == 0) goto pipe_done;
+                    buf_used += (int)bytesRead;
+                }
+                process_binary_frame(cmd, label, lbl_len, buf + header_total, dlen, pipe_writer, &pipe);
+                buf_used -= frame_total;
+                if (buf_used > 0) memmove(buf, buf + frame_total, buf_used);
             }
         }
 
@@ -1738,6 +2810,168 @@ static DWORD WINAPI pipe_listener_thread(LPVOID param) {
     return 0;
 }
 
+/* ----- Deploy mode (Windows) ----------------------------------------- */
+
+struct deploy_child {
+    HANDLE hProcess;
+    HANDLE hStdoutRead;
+    HANDLE hStderrRead;
+    char   name[64];
+    volatile int ready;
+};
+
+static deploy_child g_children[MAX_DEPLOY];
+static int g_child_count = 0;
+
+static DWORD WINAPI deploy_stdout_reader(LPVOID param) {
+    deploy_child *child = (deploy_child *)param;
+    char buf[4096];
+    DWORD bytesRead;
+    while (ReadFile(child->hStdoutRead, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        for (DWORD i = 0; i < bytesRead; i++) {
+            if (buf[i] == '\x06') child->ready = 1;
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI deploy_stderr_reader(LPVOID param) {
+    deploy_child *child = (deploy_child *)param;
+    char buf[4096];
+    DWORD bytesRead;
+    while (ReadFile(child->hStderrRead, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        fprintf(stderr, "[%s] %s", child->name, buf);
+    }
+    return 0;
+}
+
+static void deploy_terminate_children() {
+    for (int i = 0; i < g_child_count; i++) {
+        if (g_children[i].hProcess) {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, GetProcessId(g_children[i].hProcess));
+        }
+    }
+    for (int i = 0; i < g_child_count; i++) {
+        if (!g_children[i].hProcess) continue;
+        printf("  %s... ", g_children[i].name);
+        fflush(stdout);
+        DWORD wait = WaitForSingleObject(g_children[i].hProcess, 60000);
+        if (wait == WAIT_OBJECT_0) {
+            printf("ok\n");
+        } else {
+            TerminateProcess(g_children[i].hProcess, 1);
+            printf("killed\n");
+        }
+        CloseHandle(g_children[i].hProcess);
+    }
+}
+
+static BOOL WINAPI deploy_ctrl_handler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        printf("\nshutting down deploy...\n");
+        deploy_terminate_children();
+        printf("deploy shutdown complete\n");
+        ExitProcess(0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static int deploy_spawn_child(const char *exepath, deploy_entry *e) {
+    deploy_child *c = &g_children[g_child_count];
+    memset(c, 0, sizeof(*c));
+    strncpy(c->name, e->name, sizeof(c->name) - 1);
+
+    char cmdline[1024];
+    if (e->format[0])
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" --notcp --nomotd %s %d:%s", exepath, e->name, e->dim, e->format);
+    else
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" --notcp --nomotd %s %d", exepath, e->name, e->dim);
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE hStdoutRead, hStdoutWrite, hStderrRead, hStderrWrite;
+    CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0);
+    SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&hStderrRead, &hStderrWrite, &sa, 0);
+    SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hStdoutWrite;
+    si.hStdError = hStderrWrite;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    memset(&pi, 0, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                        CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "\n  ERROR: failed to spawn '%s': %lu\n", e->name, GetLastError());
+        CloseHandle(hStdoutRead); CloseHandle(hStdoutWrite);
+        CloseHandle(hStderrRead); CloseHandle(hStderrWrite);
+        return 0;
+    }
+
+    CloseHandle(hStdoutWrite);
+    CloseHandle(hStderrWrite);
+    CloseHandle(pi.hThread);
+
+    c->hProcess = pi.hProcess;
+    c->hStdoutRead = hStdoutRead;
+    c->hStderrRead = hStderrRead;
+    c->ready = 0;
+    g_child_count++;
+
+    CreateThread(NULL, 0, deploy_stdout_reader, c, 0, NULL);
+    CreateThread(NULL, 0, deploy_stderr_reader, c, 0, NULL);
+
+    while (!c->ready) {
+        DWORD exitCode;
+        if (GetExitCodeProcess(c->hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+            fprintf(stderr, "\n  ERROR: exited with code %lu\n", exitCode);
+            return 0;
+        }
+        Sleep(50);
+    }
+    return 1;
+}
+
+static int run_deploy(int port) {
+    char exepath[512];
+    GetModuleFileNameA(NULL, exepath, sizeof(exepath));
+
+    SetConsoleCtrlHandler(deploy_ctrl_handler, TRUE);
+
+    int maxlen = 0;
+    for (int i = 0; i < g_deploy_count; i++) {
+        int len = (int)strlen(g_deploy[i].name);
+        if (len > maxlen) maxlen = len;
+    }
+
+    printf("loading databases...\n");
+    for (int i = 0; i < g_deploy_count; i++) {
+        deploy_entry *e = &g_deploy[i];
+        printf("  %s%*s", e->name, maxlen - (int)strlen(e->name) + 3, "");
+        fflush(stdout);
+        if (!deploy_spawn_child(exepath, e)) {
+            deploy_terminate_children();
+            return 1;
+        }
+        printf("ok\n");
+    }
+
+    for (int i = 0; i < g_deploy_count; i++)
+        printf("Pipe listening on \\\\.\\pipe\\vec_%s\n", g_deploy[i].name);
+
+    return run_router(port, 1);
+}
+
 /* ----- Signal + Main (Windows) --------------------------------------- */
 
 static BOOL WINAPI ctrl_handler(DWORD type) {
@@ -1745,7 +2979,6 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
         if (!g_running) return TRUE;
         g_running = 0;
         printf("\nshutting down...\n");
-        save_to_file();
         return TRUE;
     }
     return FALSE;
@@ -1763,11 +2996,129 @@ int main(int argc, char **argv) {
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
+        if (strncmp(argv[i], "--topk=", 7) == 0) {
+            int v = atoi(argv[i] + 7);
+            if (v >= 1 && v <= MAX_TOP_K) g_topk = v;
+            else { fprintf(stderr, "ERROR: --topk must be between 1 and %d\n", MAX_TOP_K); return 1; }
+            continue;
+        }
         if (strcmp(argv[i], "--route") == 0) { return run_router((i + 1 < argc) ? atoi(argv[i + 1]) : 1920); }
+        if (strncmp(argv[i], "--deploy=", 9) == 0) {
+            if (parse_deploy(argv[i] + 9) <= 0) return 1;
+            int dport = DEFAULT_PORT;
+            if (i + 1 < argc) { int p = atoi(argv[i + 1]); if (p > 0 && p <= 65535) dport = p; }
+            return run_deploy(dport);
+        }
+
+        if (strcmp(argv[i], "deploy") == 0) {
+            int add_mode = (i + 1 < argc && strcmp(argv[i + 1], "--add") == 0);
+            int found = discover_all_dbs();
+            if (add_mode) {
+                deploy_wizard(0);
+                if (g_deploy_count <= found) { fprintf(stderr, "no database added\n"); return 1; }
+                for (int j = found; j < g_deploy_count; j++)
+                    write_empty_tensors(&g_deploy[j]);
+            } else if (found <= 0) {
+                found = deploy_wizard(0);
+                if (found <= 0) return 1;
+                system("cls");
+                found = g_deploy_count;
+            }
+            if (g_deploy_count == 1) {
+                fprintf(stderr, "WARNING: deploy is for multiple databases, launching single instance\n");
+                argc = 1; /* fall through to normal single-db startup */
+                break;
+            }
+            int dport = DEFAULT_PORT;
+            for (int j = i + 1; j < argc; j++) {
+                if (strcmp(argv[j], "--add") == 0) continue;
+                int p = atoi(argv[j]);
+                if (p > 0 && p <= 65535) { dport = p; break; }
+            }
+            return run_deploy(dport);
+        }
+
+        if (strcmp(argv[i], "--delete") == 0) {
+            if (i < 2 || strcmp(argv[1], "--delete") == 0) {
+                fprintf(stderr, "usage: vec-cpu <name> --delete\n");
+                return 1;
+            }
+            const char *name = argv[1];
+            WIN32_FIND_DATAA fd;
+            char pattern[512];
+            int deleted = 0;
+
+            snprintf(pattern, sizeof(pattern), "%s_*.tensors", name);
+            HANDLE h = FindFirstFileA(pattern, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (DeleteFileA(fd.cFileName)) {
+                        printf("deleted %s\n", fd.cFileName);
+                        deleted++;
+                    } else {
+                        fprintf(stderr, "ERROR: could not delete %s\n", fd.cFileName);
+                    }
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+
+            snprintf(pattern, sizeof(pattern), "%s_*.meta", name);
+            h = FindFirstFileA(pattern, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (DeleteFileA(fd.cFileName)) {
+                        printf("deleted %s\n", fd.cFileName);
+                        deleted++;
+                    } else {
+                        fprintf(stderr, "ERROR: could not delete %s\n", fd.cFileName);
+                    }
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+
+            if (deleted == 0) {
+                fprintf(stderr, "no database files found for '%s'\n", name);
+                return 1;
+            }
+            printf("destroyed %d file(s) for database '%s'\n", deleted, name);
+            return 0;
+        }
+
+        if (strcmp(argv[i], "--check") == 0 || strcmp(argv[i], "--repair") == 0) {
+            int dry_run = (strcmp(argv[i], "--check") == 0);
+            if (i >= 2) {
+                strncpy(g_name, argv[1], sizeof(g_name) - 1);
+                if (!find_existing_db(argv[1])) {
+                    fprintf(stderr, "ERROR: no database found for '%s'\n", argv[1]);
+                    return 1;
+                }
+                return run_repair(dry_run);
+            }
+            WIN32_FIND_DATAA cfd;
+            HANDLE ch = FindFirstFileA("*.tensors", &cfd);
+            if (ch == INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "no .tensors files found in current directory\n");
+                return 1;
+            }
+            int total = 0, errors = 0;
+            do {
+                strncpy(g_filepath, cfd.cFileName, sizeof(g_filepath) - 1);
+                printf("--- %s ---\n", g_filepath);
+                int r = run_repair(dry_run);
+                if (r != 0) errors++;
+                total++;
+                printf("\n");
+            } while (FindNextFileA(ch, &cfd));
+            FindClose(ch);
+            printf("checked %d database(s), %d with issues\n", total, errors);
+            return (errors > 0) ? 1 : 0;
+        }
     }
 
     int no_tcp = 0;
+    int no_motd = 0;
     if (argc > 1 && strcmp(argv[1], "--notcp") == 0) { no_tcp = 1; argc--; argv++; }
+    if (argc > 1 && strcmp(argv[1], "--nomotd") == 0) { no_motd = 1; argc--; argv++; }
 
     int port_arg_idx = -1;
 
@@ -1839,7 +3190,7 @@ int main(int argc, char **argv) {
     double total_ram_gb = ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
     double max_records = (ms.ullTotalPhys * 0.8) / ((double)g_dim * g_elem_size);
 
-    printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
+    if (!no_motd) printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
     if (total_ram_gb < 8.0)
         fprintf(stderr, "WARN: only %.1f GB RAM available\n", total_ram_gb);
 
@@ -1858,7 +3209,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    print_startup_info(file_exists, lr, max_records);
+    /* check write permission */
+    {
+        FILE *tf = fopen(g_filepath, "ab");
+        if (tf) { fclose(tf); }
+        else { g_readonly = 1; }
+    }
+
+    if (!no_motd) print_startup_info(file_exists, lr, max_records);
+    if (g_readonly) printf("WARNING: read-only mode (cannot write to %s)\n", g_filepath);
 
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
@@ -1873,13 +3232,21 @@ int main(int argc, char **argv) {
         release_instance_lock();
         return 1;
     }
-    printf("ready for connections, ctrl+c to exit\n");
+    if (no_motd) {
+        putchar('\x06');
+        fflush(stdout);
+    } else {
+        printf("ready for connections, ctrl+c to exit\n");
+        if (no_tcp)
+            printf("hint: use --route to expose this instance via TCP\n");
+    }
 
     while (g_running) { Sleep(500); }
 
     if (h_tcp) WaitForSingleObject(h_tcp, 3000);
     WaitForSingleObject(h_pipe, 3000);
 
+    save_to_file();
     gpu_shutdown();
     release_instance_lock();
     return 0;
@@ -1932,15 +3299,17 @@ static int find_any_db() {
     glob_t gl;
     if (glob("*.tensors", 0, NULL, &gl) != 0) return 0;
 
-    int best_score = -1;
+    db_entry entries[64];
+    int count = 0;
 
-    for (size_t i = 0; i < gl.gl_pathc; i++) {
+    for (size_t i = 0; i < gl.gl_pathc && count < 64; i++) {
         const char *path = gl.gl_pathv[i];
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
 
         char buf[256];
         strncpy(buf, base, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
         char *ext = strstr(buf, ".tensors");
         if (!ext) continue;
         *ext = '\0';
@@ -1957,27 +3326,44 @@ static int find_any_db() {
         int d = atoi(ds + 1);
         if (d <= 0) continue;
 
-        int fv = (strcmp(fs, "f16") == 0) ? FMT_F16 : FMT_F32;
+        strncpy(entries[count].name, buf, sizeof(entries[count].name) - 1);
+        entries[count].dim = d;
+        entries[count].fmt = (strcmp(fs, "f16") == 0) ? FMT_F16 : FMT_F32;
+        strncpy(entries[count].filename, path, sizeof(entries[count].filename) - 1);
+        struct stat st;
+        entries[count].file_size = (stat(path, &st) == 0) ? st.st_size : 0;
+        count++;
+    }
+    globfree(&gl);
 
-        int score = 0;
-        if (fv == FMT_F32) score += 100;
-        if (d == 1024) score += 50;
+    if (count == 0) return 0;
 
-        if (score > best_score) {
-            best_score = score;
-            strncpy(g_name, buf, sizeof(g_name) - 1);
-            g_dim = d;
-            if (fv == FMT_F16) { g_fmt = FMT_F16; g_elem_size = 2; }
-            else { g_fmt = FMT_F32; g_elem_size = 4; }
+    int pick = 0;
+    if (count > 1) {
+        printf("databases found:\n");
+        for (int i = 0; i < count; i++) {
+            char sz[32];
+            fmt_bytes(sz, sizeof(sz), (double)entries[i].file_size);
+            printf("  [%d] %s (%d dim, %s, %s)\n", i + 1, entries[i].name,
+                   entries[i].dim, entries[i].fmt == FMT_F16 ? "f16" : "f32", sz);
+        }
+        printf("select [1-%d]: ", count);
+        fflush(stdout);
+        char input[16];
+        if (!fgets(input, sizeof(input), stdin)) return 0;
+        pick = atoi(input) - 1;
+        if (pick < 0 || pick >= count) {
+            fprintf(stderr, "invalid selection\n");
+            return 0;
         }
     }
 
-    globfree(&gl);
-    if (best_score >= 0) {
-        build_filepath();
-        return 1;
-    }
-    return 0;
+    strncpy(g_name, entries[pick].name, sizeof(g_name) - 1);
+    g_dim = entries[pick].dim;
+    if (entries[pick].fmt == FMT_F16) { g_fmt = FMT_F16; g_elem_size = 2; }
+    else { g_fmt = FMT_F32; g_elem_size = 4; }
+    build_filepath();
+    return 1;
 }
 
 static int find_existing_db(const char *name) {
@@ -2035,6 +3421,45 @@ static int find_existing_db(const char *name) {
     return 0;
 }
 
+static int discover_all_dbs() {
+    glob_t gl;
+    if (glob("*.tensors", 0, NULL, &gl) != 0) return 0;
+
+    for (size_t i = 0; i < gl.gl_pathc && g_deploy_count < MAX_DEPLOY; i++) {
+        const char *path = gl.gl_pathv[i];
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+
+        char buf[256];
+        strncpy(buf, base, sizeof(buf) - 1);
+        char *ext = strstr(buf, ".tensors");
+        if (!ext) continue;
+        *ext = '\0';
+
+        char *ls = strrchr(buf, '_');
+        if (!ls) continue;
+        *ls = '\0';
+        const char *fs = ls + 1;
+
+        char *ds = strrchr(buf, '_');
+        if (!ds) continue;
+        *ds = '\0';
+
+        int d = atoi(ds + 1);
+        if (d <= 0) continue;
+
+        deploy_entry *e = &g_deploy[g_deploy_count];
+        memset(e, 0, sizeof(*e));
+        strncpy(e->name, buf, sizeof(e->name) - 1);
+        e->dim = d;
+        if (strcmp(fs, "f16") == 0) strncpy(e->format, "f16", sizeof(e->format) - 1);
+        g_deploy_count++;
+    }
+
+    globfree(&gl);
+    return g_deploy_count;
+}
+
 /* ----- TCP (Linux) --------------------------------------------------- */
 
 static int sock_writer(void *ctx, const char *buf, int len) {
@@ -2055,34 +3480,50 @@ static void *client_thread(void *param) {
         buf[buf_used] = '\0';
 
         while (1) {
-            char *nl = (char *)memchr(buf, '\n', buf_used);
-            if (!nl) break;
-            int line_len = (int)(nl - buf);
+            if (buf_used < 1) break;
 
-            int is_binary = (line_len >= 5 && strncmp(buf, "bpush", 5) == 0) ||
-                            (line_len >= 5 && strncmp(buf, "bpull", 5) == 0) ||
-                            (line_len >= 6 && strncmp(buf, "bcpull", 6) == 0);
-            if (is_binary) {
-                int payload_bytes = g_dim * (int)sizeof(float);
-                int header_bytes = line_len + 1;
-                int total_needed = header_bytes + payload_bytes;
-                while (buf_used < total_needed && g_running) {
-                    r = recv(client, buf + buf_used, MAX_LINE - buf_used, 0);
-                    if (r <= 0) goto done;
-                    buf_used += r;
-                }
-                int rc = process_command(buf, line_len, sock_writer, &client, buf + header_bytes, payload_bytes);
-                int consumed = total_needed;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (rc == 1) goto done;
-            } else {
-                int rc = process_command(buf, line_len, sock_writer, &client, NULL, 0);
-                int consumed = line_len + 1;
-                buf_used -= consumed;
-                if (buf_used > 0) memmove(buf, buf + consumed, buf_used);
-                if (rc == 1) goto done;
+            if ((unsigned char)buf[0] != BIN_MAGIC) {
+                int skip = 1;
+                while (skip < buf_used && (unsigned char)buf[skip] != BIN_MAGIC) skip++;
+                buf_used -= skip;
+                if (buf_used > 0) memmove(buf, buf + skip, buf_used);
+                continue;
             }
+
+            /* binary frame */
+            if (buf_used < 3) break;
+            unsigned short ns_len; memcpy(&ns_len, buf + 1, 2);
+            int hdr = 3 + ns_len;
+            if (buf_used < hdr + 3) break;
+            unsigned char cmd = (unsigned char)buf[hdr];
+            unsigned short lbl_len; memcpy(&lbl_len, buf + hdr + 1, 2);
+            int header_total = hdr + 3 + lbl_len + 4; /* +4 for explicit body_len (2.0) */
+            if (buf_used < header_total) break;
+            const char *label = (lbl_len > 0) ? buf + hdr + 3 : NULL;
+            const char *data_start = buf + hdr + 3 + lbl_len;
+            int available = buf_used - (hdr + 3 + lbl_len);
+            int dlen = frame_data_len(cmd, data_start, available, lbl_len);
+            if (dlen == -1) break;
+            if (dlen == -2) {
+                const char *err = "unknown binary command";
+                char ebuf[64]; ebuf[0] = RESP_ERR;
+                unsigned int el = (unsigned int)strlen(err);
+                memcpy(ebuf + 1, &el, 4);
+                memcpy(ebuf + 5, err, el);
+                send(client, ebuf, 5 + el, 0);
+                buf_used -= header_total;
+                if (buf_used > 0) memmove(buf, buf + header_total, buf_used);
+                continue;
+            }
+            int frame_total = header_total + dlen;
+            while (buf_used < frame_total && g_running) {
+                r = recv(client, buf + buf_used, MAX_LINE - buf_used, 0);
+                if (r <= 0) goto done;
+                buf_used += r;
+            }
+            process_binary_frame(cmd, label, lbl_len, buf + header_total, dlen, sock_writer, &client);
+            buf_used -= frame_total;
+            if (buf_used > 0) memmove(buf, buf + frame_total, buf_used);
         }
     }
 
@@ -2186,14 +3627,183 @@ static void *unix_listener_thread(void *param) {
     return NULL;
 }
 
+/* ----- Deploy mode (Linux) ------------------------------------------- */
+
+struct deploy_child {
+    pid_t  pid;
+    int    stdout_fd;
+    int    stderr_fd;
+    char   name[64];
+    volatile int ready;
+};
+
+static deploy_child g_children[MAX_DEPLOY];
+static int g_child_count = 0;
+
+static void *deploy_stdout_reader(void *param) {
+    deploy_child *child = (deploy_child *)param;
+    char buf[4096];
+    while (1) {
+        ssize_t rd = read(child->stdout_fd, buf, sizeof(buf) - 1);
+        if (rd <= 0) break;
+        for (ssize_t i = 0; i < rd; i++) {
+            if (buf[i] == '\x06') child->ready = 1;
+        }
+    }
+    return NULL;
+}
+
+static void *deploy_stderr_reader(void *param) {
+    deploy_child *child = (deploy_child *)param;
+    char buf[4096];
+    while (1) {
+        ssize_t rd = read(child->stderr_fd, buf, sizeof(buf) - 1);
+        if (rd <= 0) break;
+        buf[rd] = '\0';
+        fprintf(stderr, "[%s] %s", child->name, buf);
+    }
+    return NULL;
+}
+
+static void deploy_terminate_children() {
+    for (int i = 0; i < g_child_count; i++) {
+        if (g_children[i].pid > 0) kill(g_children[i].pid, SIGINT);
+    }
+    for (int i = 0; i < g_child_count; i++) {
+        if (g_children[i].pid <= 0) continue;
+        printf("  %s... ", g_children[i].name);
+        fflush(stdout);
+        int status;
+        int waited = 0;
+        for (int t = 0; t < 600; t++) {
+            if (waitpid(g_children[i].pid, &status, WNOHANG) != 0) { waited = 1; break; }
+            usleep(100000);
+        }
+        if (waited) {
+            printf("ok\n");
+        } else {
+            kill(g_children[i].pid, SIGKILL);
+            waitpid(g_children[i].pid, &status, 0);
+            printf("killed\n");
+        }
+    }
+}
+
+static void deploy_sig_handler(int sig) {
+    (void)sig;
+    printf("\nshutting down deploy...\n");
+    deploy_terminate_children();
+    printf("deploy shutdown complete\n");
+    _exit(0);
+}
+
+static int deploy_spawn_child(const char *exepath, deploy_entry *e) {
+    deploy_child *c = &g_children[g_child_count];
+    memset(c, 0, sizeof(*c));
+    strncpy(c->name, e->name, sizeof(c->name) - 1);
+
+    int stdout_pipe[2], stderr_pipe[2];
+    if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
+        fprintf(stderr, "\n  ERROR: pipe() failed: %s\n", strerror(errno));
+        return 0;
+    }
+
+    char dim_arg[64];
+    if (e->format[0])
+        snprintf(dim_arg, sizeof(dim_arg), "%d:%s", e->dim, e->format);
+    else
+        snprintf(dim_arg, sizeof(dim_arg), "%d", e->dim);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "\n  ERROR: fork() failed: %s\n", strerror(errno));
+        return 0;
+    }
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl(exepath, exepath, "--notcp", "--nomotd", e->name, dim_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    c->pid = pid;
+    c->stdout_fd = stdout_pipe[0];
+    c->stderr_fd = stderr_pipe[0];
+    c->ready = 0;
+    g_child_count++;
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, deploy_stdout_reader, c);
+    pthread_detach(t1);
+    pthread_create(&t2, NULL, deploy_stderr_reader, c);
+    pthread_detach(t2);
+
+    while (!c->ready) {
+        int status;
+        pid_t r = waitpid(c->pid, &status, WNOHANG);
+        if (r > 0) {
+            fprintf(stderr, "\n  ERROR: exited before ready\n");
+            c->pid = 0;
+            return 0;
+        }
+        usleep(50000);
+    }
+    return 1;
+}
+
+static int run_deploy(int port) {
+    char exepath[512] = {0};
+    ssize_t len = readlink("/proc/self/exe", exepath, sizeof(exepath) - 1);
+    if (len <= 0) {
+        fprintf(stderr, "ERROR: cannot determine own executable path\n");
+        return 1;
+    }
+    exepath[len] = '\0';
+
+    int maxlen = 0;
+    for (int i = 0; i < g_deploy_count; i++) {
+        int l = (int)strlen(g_deploy[i].name);
+        if (l > maxlen) maxlen = l;
+    }
+
+    printf("loading databases...\n");
+    for (int i = 0; i < g_deploy_count; i++) {
+        deploy_entry *e = &g_deploy[i];
+        printf("  %s%*s", e->name, maxlen - (int)strlen(e->name) + 3, "");
+        fflush(stdout);
+        if (!deploy_spawn_child(exepath, e)) {
+            deploy_terminate_children();
+            return 1;
+        }
+        printf("ok\n");
+    }
+
+    for (int i = 0; i < g_deploy_count; i++)
+        printf("Socket listening on /tmp/vec_%s.sock\n", g_deploy[i].name);
+
+    struct sigaction sa;
+    sa.sa_handler = deploy_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    return run_router(port, 1);
+}
+
 /* ----- Signal + Main (Linux) ----------------------------------------- */
 
 static void sig_handler(int sig) {
     (void)sig;
     if (!g_running) return;
     g_running = 0;
-    printf("\nshutting down...\n");
-    save_to_file();
 }
 
 int main(int argc, char **argv) {
@@ -2214,11 +3824,126 @@ int main(int argc, char **argv) {
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
+        if (strncmp(argv[i], "--topk=", 7) == 0) {
+            int v = atoi(argv[i] + 7);
+            if (v >= 1 && v <= MAX_TOP_K) g_topk = v;
+            else { fprintf(stderr, "ERROR: --topk must be between 1 and %d\n", MAX_TOP_K); return 1; }
+            continue;
+        }
         if (strcmp(argv[i], "--route") == 0) { return run_router((i + 1 < argc) ? atoi(argv[i + 1]) : 1920); }
+        if (strncmp(argv[i], "--deploy=", 9) == 0) {
+            if (parse_deploy(argv[i] + 9) <= 0) return 1;
+            int dport = DEFAULT_PORT;
+            if (i + 1 < argc) { int p = atoi(argv[i + 1]); if (p > 0 && p <= 65535) dport = p; }
+            return run_deploy(dport);
+        }
+
+        if (strcmp(argv[i], "deploy") == 0) {
+            int add_mode = (i + 1 < argc && strcmp(argv[i + 1], "--add") == 0);
+            int found = discover_all_dbs();
+            if (add_mode) {
+                deploy_wizard(0);
+                if (g_deploy_count <= found) { fprintf(stderr, "no database added\n"); return 1; }
+                for (int j = found; j < g_deploy_count; j++)
+                    write_empty_tensors(&g_deploy[j]);
+            } else if (found <= 0) {
+                found = deploy_wizard(0);
+                if (found <= 0) return 1;
+                system("clear");
+                found = g_deploy_count;
+            }
+            if (g_deploy_count == 1) {
+                fprintf(stderr, "WARNING: deploy is for multiple databases, launching single instance\n");
+                argc = 1; /* fall through to normal single-db startup */
+                break;
+            }
+            int dport = DEFAULT_PORT;
+            for (int j = i + 1; j < argc; j++) {
+                if (strcmp(argv[j], "--add") == 0) continue;
+                int p = atoi(argv[j]);
+                if (p > 0 && p <= 65535) { dport = p; break; }
+            }
+            return run_deploy(dport);
+        }
+
+        if (strcmp(argv[i], "--delete") == 0) {
+            if (i < 2 || strcmp(argv[1], "--delete") == 0) {
+                fprintf(stderr, "usage: vec-cpu <name> --delete\n");
+                return 1;
+            }
+            const char *name = argv[1];
+            char pattern[512];
+            int deleted = 0;
+
+            snprintf(pattern, sizeof(pattern), "%s_*.tensors", name);
+            glob_t gl;
+            if (glob(pattern, 0, NULL, &gl) == 0) {
+                for (size_t j = 0; j < gl.gl_pathc; j++) {
+                    if (remove(gl.gl_pathv[j]) == 0) {
+                        printf("deleted %s\n", gl.gl_pathv[j]);
+                        deleted++;
+                    } else {
+                        fprintf(stderr, "ERROR: could not delete %s\n", gl.gl_pathv[j]);
+                    }
+                }
+                globfree(&gl);
+            }
+
+            snprintf(pattern, sizeof(pattern), "%s_*.meta", name);
+            if (glob(pattern, 0, NULL, &gl) == 0) {
+                for (size_t j = 0; j < gl.gl_pathc; j++) {
+                    if (remove(gl.gl_pathv[j]) == 0) {
+                        printf("deleted %s\n", gl.gl_pathv[j]);
+                        deleted++;
+                    } else {
+                        fprintf(stderr, "ERROR: could not delete %s\n", gl.gl_pathv[j]);
+                    }
+                }
+                globfree(&gl);
+            }
+
+            if (deleted == 0) {
+                fprintf(stderr, "no database files found for '%s'\n", name);
+                return 1;
+            }
+            printf("destroyed %d file(s) for database '%s'\n", deleted, name);
+            return 0;
+        }
+
+        if (strcmp(argv[i], "--check") == 0 || strcmp(argv[i], "--repair") == 0) {
+            int dry_run = (strcmp(argv[i], "--check") == 0);
+            if (i >= 2) {
+                strncpy(g_name, argv[1], sizeof(g_name) - 1);
+                if (!find_existing_db(argv[1])) {
+                    fprintf(stderr, "ERROR: no database found for '%s'\n", argv[1]);
+                    return 1;
+                }
+                return run_repair(dry_run);
+            }
+            glob_t cgl;
+            if (glob("*.tensors", 0, NULL, &cgl) != 0) {
+                fprintf(stderr, "no .tensors files found in current directory\n");
+                return 1;
+            }
+            int total = 0, errors = 0;
+            for (size_t j = 0; j < cgl.gl_pathc; j++) {
+                strncpy(g_filepath, cgl.gl_pathv[j], sizeof(g_filepath) - 1);
+                printf("--- %s ---\n", g_filepath);
+                int r = run_repair(dry_run);
+                if (r != 0) errors++;
+                total++;
+                printf("\n");
+            }
+            globfree(&cgl);
+            printf("checked %d database(s), %d with issues\n", total, errors);
+            return (errors > 0) ? 1 : 0;
+        }
     }
 
     int no_tcp = 0;
+    int no_motd = 0;
     if (argc > 1 && strcmp(argv[1], "--notcp") == 0) { no_tcp = 1; argc--; argv++; }
+    if (argc > 1 && strcmp(argv[1], "--nomotd") == 0) { no_motd = 1; argc--; argv++; }
 
     int port_arg_idx = -1;
 
@@ -2291,7 +4016,7 @@ int main(int argc, char **argv) {
     double total_ram_gb = (double)pages * page_size / (1024.0 * 1024.0 * 1024.0);
     double max_records = (total_ram_gb * 1024.0 * 1024.0 * 1024.0 * 0.8) / ((double)g_dim * g_elem_size);
 
-    printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
+    if (!no_motd) printf("vec-cpu (%.1f GB RAM)\n", total_ram_gb);
     if (total_ram_gb < 8.0)
         fprintf(stderr, "WARN: only %.1f GB RAM available\n", total_ram_gb);
 
@@ -2310,7 +4035,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    print_startup_info(file_exists, lr, max_records);
+    /* check write permission */
+    {
+        FILE *tf = fopen(g_filepath, "ab");
+        if (tf) { fclose(tf); }
+        else { g_readonly = 1; }
+    }
+
+    if (!no_motd) print_startup_info(file_exists, lr, max_records);
+    if (g_readonly) printf("WARNING: read-only mode (cannot write to %s)\n", g_filepath);
 
     struct sigaction sa;
     sa.sa_handler = sig_handler;
@@ -2331,13 +4064,22 @@ int main(int argc, char **argv) {
         release_instance_lock();
         return 1;
     }
-    printf("ready for connections, ctrl+c to exit\n");
+    if (no_motd) {
+        putchar('\x06');
+        fflush(stdout);
+    } else {
+        printf("ready for connections, ctrl+c to exit\n");
+        if (no_tcp)
+            printf("hint: use --route to expose this instance via TCP\n");
+    }
 
     while (g_running) { usleep(500000); }
 
+    printf("\nshutting down...\n");
     if (has_tcp) pthread_join(t_tcp, NULL);
     pthread_join(t_unix, NULL);
 
+    save_to_file();
     gpu_shutdown();
     release_instance_lock();
     return 0;

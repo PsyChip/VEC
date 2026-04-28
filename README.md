@@ -1,242 +1,133 @@
-# VEC
+# VEC 2.0
 
-**Dead simple GPU-resident vector database.**
+A dead simple vector database that lives on your GPU. Now with a sidecar payload field — every record is `(vector, label, ≤100KB blob)`. The MySQL sidekick is gone; one exe replaces both.
 
-Keep up to 6 million 1024-dim records in your RTX 3090. Query them back with ~10ms latency.
+Store millions of embeddings in VRAM. Find the nearest ones in milliseconds. Single exe, no dependencies, no configuration.
 
-Single exe. ~300KB. No libraries. No dependencies. No configuration. Windows and Linux.
-
-```
+```bash
+# Start a database
 vec mydb 1024
+
+# That's it. It's listening on port 1920.
 ```
 
-Also ships `vec-cpu` - same protocol, same features, runs on any machine without GPU.
+No GPU? No problem. `vec-cpu` does the same thing using RAM.
 
----
-
-## Supported GPUs (vec)
-
-| Architecture | Generation | Examples |
-|---|---|---|
-| Turing | RTX 2000 series | RTX 2060, 2070, 2080, T4 |
-| Ampere | RTX 3000 series | RTX 3060, 3070, 3080, 3090, A100, A40 |
-| Ada Lovelace | RTX 4000 series | RTX 4060, 4070, 4080, 4090, L40 |
-
-Not supported: GTX 1000 series (Pascal) and older. AMD and Intel GPUs are not supported. Use `vec-cpu` instead.
-
-## Capacity (fp32)
-
-| Dimensions | 8 GB VRAM | 12 GB VRAM | 24 GB VRAM |
-|---|---|---|---|
-| 384 | 5.2M | 7.8M | 15.7M |
-| 512 | 3.9M | 5.8M | 11.7M |
-| 768 | 2.6M | 3.9M | 7.8M |
-| 1024 | 1.9M | 2.9M | 5.8M |
-
-## Query latency (1024 dim)
-
-| Vectors | GPU (RTX 3060) | CPU |
-|---|---|---|
-| 10K | ~0.2 ms | ~2 ms |
-| 100K | ~1.5 ms | ~20 ms |
-| 1M | ~14 ms | ~200 ms |
-
----
-
-## Usage
-
-```
-vec <name> [dim[:format]] [port]
-vec <file.tensors> [port]
-vec --help
-vec --notcp <name> [dim] [port]
-vec --route <port>
+```bash
+vec-cpu mydb 1024
 ```
 
-```
-vec                        :: auto-detect .tensors in dir or create new
-vec mydb                   :: find mydb_*.tensors or create 1024/fp32
-vec mydb 1024              :: explicit dimension
-vec mydb 1024:f16          :: fp16 storage, 2x capacity
-vec mydb 1024 1921         :: custom port
-vec mydb.tensors           :: load from file
-vec --help                 :: show all commands
-```
-
-### File discovery
-
-On startup with no arguments, vec scans the current directory for `.tensors` files and loads the best match. When loading, also loads `.meta` file for labels if it exists.
-
-### Router mode
-
-Run multiple instances with pipe-only mode, route them through one TCP port:
-
-```
-vec --notcp tools 1024
-vec --notcp conversations 1024
-vec --route 1920
-```
-
-Client sends commands with namespace: `push tools 0.12,...\n`
+> **Upgrading from 1.x?** See `MIGRATION.md`. Server protocol is a clean break — old SDKs won't work. `.tensors` and `.meta` files load unchanged; `.data` is a new sidecar that appears on first save once you store payloads.
 
 ---
 
 ## Protocol
 
-Plain text over TCP. One command in, one line out. Same on named pipe (Windows) and unix socket (Linux).
-
-| Command | Example | Response |
-|---|---|---|
-| **push** | `push label 0.12,0.45,...\n` | `42\n` |
-| **push** | `push "quoted label" 0.12,0.45,...\n` | `42\n` |
-| **bpush** | `bpush label\n` + raw bytes | `42\n` |
-| **pull** | `pull 0.12,0.45,...\n` | `label:0.0012,...\n` |
-| **cpull** | `cpull 0.12,0.45,...\n` | `label:0.0012,...\n` |
-| **bpull** | `bpull\n` + raw bytes | `label:0.0012,...\n` |
-| **bcpull** | `bcpull\n` + raw bytes | `label:0.0012,...\n` |
-| **label** | `label 42 "new label"\n` | `ok\n` |
-| **delete** | `delete 42\n` | `ok\n` |
-| **undo** | `undo\n` | `ok\n` |
-| **save** | `save\n` | `ok\n` |
-| **size** | `size\n` | `50\n` |
-| **dim** | `dim\n` | `1024\n` |
-
-### Push
+Binary only. Every request and every response is a length-prefixed binary frame over TCP, named pipe, or Unix socket.
 
 ```
-push docs/report.pdf?page=2 0.12,0.45,...\n          -> 42
-push "user: how does the engine work?" 0.12,0.45,...\n -> 43
-push 0.12,0.45,...\n                                    -> 44 (no label)
+request:  F0 <2B ns_len> [ns] <CMD> <2B label_len> [label] <4B body_len> [body]
+response: <1B status> <4B body_len> [body]        ; status 0=ok, 1=err
 ```
 
-Use quotes for labels with spaces. No quotes needed for simple paths.
+15 commands, one envelope. See `PROTOCOL-2.0.md` for the byte-exact spec or `sdk/README.md` for the quick reference.
 
-### Binary push/query
-
-```
-bpush label\n<dim*4 bytes>     -> 42 (binary push)
-bpull\n<dim*4 bytes>           -> results (L2 binary query)
-bcpull\n<dim*4 bytes>          -> results (cosine binary query)
-```
-
-Same as text versions but vector sent as raw fp32 bytes. Skips CSV parsing.
-
-### Query results
-
-```
-pull 0.12,0.45,...\n
--> docs/report.pdf?page=2:0.001234,photos/beach.jpg:0.045100,42:0.234000
-```
-
-`label:distance` pairs (or `index:distance` when no label). Comma-separated, nearest first. Up to 10 results. Parse by splitting on last colon per result.
-
-### L2 vs Cosine
-
-```
-  L2 (pull/bpull)                    Cosine (cpull/bcpull)
-  How far apart?                     Looking the same way?
-  [1,0] vs [10,0] = far             [1,0] vs [10,0] = same direction
-  Vision: DINOv2, ArcFace            Text: BGE, MiniLM, CLIP
-```
-
-### Labels
-
-Labels must not contain colons or commas (stripped with warning). Newlines and tabs escaped to `\n` and `\t`. UTF-8 BOM stripped. Use quotes for labels with spaces.
-
-```
-label 42 docs/report.pdf?page=2\n        -> ok
-label 42 "label with spaces"\n           -> ok
-```
-
-### Errors
-
-```
-err dim mismatch: got 3, expected 1024
-err index out of range
-err already deleted
-err unknown command
-```
+Use the SDK libraries — there is no text interface.
 
 ---
 
-## vec-cpu
+## What it does
 
-Same protocol, same file format, same features. Runs on any machine without GPU.
+- **PUSH** — store a vector, optionally with a label and a ≤100KB data payload (data requires label). Returns the slot index.
+- **QUERY** — nearest-neighbor search; metric byte selects L2 or cosine.
+- **QID** — like QUERY but the query is an existing stored vector (by index or label).
+- **GET** — retrieve records by index, by label (may yield multiple), or batch by index list.
+- **SET_DATA / GET_DATA** — manage the per-slot payload independently of the vector.
+- **UPDATE** — overwrite a vector in place (label and data untouched).
+- **LABEL** — set or clear a slot's label.
+- **DELETE** — tombstone a slot (also frees its label and data).
+- **UNDO** — remove the last PUSH (also frees its label and data).
+- **CLUSTER** — DBSCAN over the full set.
+- **DISTINCT** — farthest-point sampling (k most spread-out vectors).
+- **REPRESENT** — one most-distinct member per cluster.
+- **INFO** — database metadata (dim, count, format, CRC, name, protocol version).
+- **SAVE** — flush to disk; returns saved count + CRC.
 
-```
-vec-cpu mydb 1024
-```
+## Result shape
 
-### Performance (CPU, 1024 dim)
+QUERY/QID/GET take a 1-byte **shape mask** that controls what each result record carries:
 
-| Records | Latency |
-|---|---|
-| 10K | ~2 ms |
-| 100K | ~20 ms |
-| 1M | ~200 ms |
+- `0x01` vector
+- `0x02` label
+- `0x04` data
+- `0x07` all three (default)
 
-Built with AVX2 auto-vectorization and fast-math on Windows (`/arch:AVX2 /fp:fast`), native SIMD on Linux (`-O3 -march=native -ffast-math`).
+Skip what you don't need to keep responses lean.
 
-### Requirements
+## L2 vs Cosine
 
-- Windows or Linux (64-bit)
-- No GPU needed, no CUDA needed
-- fp32 only (fp16 requires GPU)
+- **L2** (squared Euclidean) — "how far apart?" Use for vision models (DINOv2, ArcFace).
+- **Cosine** — "looking the same direction?" Use for text models (BGE, MiniLM, CLIP).
 
-On startup, checks available RAM. Warns if less than 8 GB.
+QUERY and QID take a metric byte (0=L2 default, 1=cosine). CLUSTER/DISTINCT/REPRESENT take the same byte.
 
 ---
 
-## Build
+## Multiple databases
 
-### Requirements
-
-- `vec`: NVIDIA CUDA Toolkit 12.x, MSVC (v14.41 or older) or gcc + nvcc
-- `vec-cpu`: just MSVC or gcc (no CUDA needed)
-
-### Windows
-
-```cmd
-build.bat
-```
-
-Builds: `vec.exe`, `vec-cpu.exe`, `test.exe`
-
-### Linux
+Run them behind a router:
 
 ```bash
-./build.sh
+# Start databases without TCP (pipe/socket only)
+vec --notcp tools 1024
+vec --notcp conversations 1024
+
+# Route them all through one port
+vec --route 1920
 ```
 
-Builds: `vec`, `vec-cpu`
+Or let deploy mode do it all:
 
-### Manual build
+```bash
+# Auto-discover all .tensors files
+vec deploy
 
-```
-:: vec (GPU)
-nvcc -O2 -c vec_kernel.cu -o vec_kernel.obj <gencode flags>
-nvcc -O2 vec_kernel.obj vec.cpp -o vec.exe -lws2_32 -lmpr <gencode flags>
+# Custom port
+vec deploy 1920
 
-:: vec-cpu (CPU)
-cl /O2 /arch:AVX2 /fp:fast /EHsc vec-cpu.cpp /Fe:vec-cpu.exe ws2_32.lib mpr.lib
-
-:: test
-cl /O2 /EHsc test.cpp /Fe:test.exe ws2_32.lib
+# Explicit schema
+vec --deploy=tools:1024,conversations:1024,faces:512:f16 1920
 ```
 
-### Test
+The SDK sets a namespace on the client. The router strips it from the frame and forwards to the correct backend.
 
-```
-:: single instance test
-vec mydb 1024
-test mydb 1024
+---
+
+## Housekeeping
+
+```bash
+# Delete an entire database
+vec face --delete
+
+# Check file integrity (dry run)
+vec mydb --check
+
+# Repair a corrupt database
+vec mydb --repair
+
+# Auto-detect .tensors in current directory
+vec
+
+# Load a specific file
+vec mydb.tensors
+
+# fp16 mode — half the VRAM, double the capacity (GPU only)
+vec mydb 1024:f16
 ```
 
 ---
 
-## Startup
-
-On startup, vec prints a status block:
+## What it looks like
 
 ```
 NVIDIA GeForce RTX 3060 (12.0 GB)
@@ -251,68 +142,88 @@ NVIDIA GeForce RTX 3060 (12.0 GB)
 ===================================================================
 ```
 
-vec-cpu shows RAM instead of GPU:
+---
+
+## Performance
+
+1024-dim vectors:
 
 ```
-vec-cpu (32.0 GB RAM)
-===================================================================
-  ...
-===================================================================
+             GPU (RTX 3060)    CPU
+  10K        ~0.2 ms           ~2 ms
+  100K       ~1.5 ms           ~20 ms
+  1M         ~14 ms            ~200 ms
 ```
+
+## Capacity
+
+fp32, 1024 dimensions:
+
+```
+  8 GB VRAM     1.9M vectors
+  12 GB VRAM    2.9M vectors
+  24 GB VRAM    5.8M vectors
+```
+
+Lower dimensions or fp16 = more capacity.
 
 ---
 
-## File format
+## Supported GPUs
 
-### .tensors
+RTX 2000 series and newer (Turing, Ampere, Ada Lovelace). RTX 2060 through 4090, plus T4, A100, L40.
 
+GTX 1000 series and older won't work. AMD/Intel GPUs won't work. Use `vec-cpu` instead.
+
+---
+
+## Build
+
+```bash
+# Windows
+build.bat
+
+# Linux
+./build.sh
 ```
-[4B dim][4B count][4B deleted][1B format][count B alive mask][vector data][4B CRC32]
-```
 
-Naming: `<name>_<dim>_<format>.tensors`
-
-### .meta (labels, only when labels exist)
-
-```
-[4B count][per label: 4B length + string bytes]
-```
+Requires NVIDIA CUDA Toolkit 12.x for `vec`. `vec-cpu` just needs a C++ compiler.
 
 ---
 
 ## Good to know
 
-- **Brute force by design.** Every query reads every vector. Exact results, no approximation.
-- **Indices are permanent.** Slot 42 stays 42 forever. Delete tombstones but never compacts.
-- **Labels are free.** CPU RAM only. Zero impact on query performance.
-- **Labels are sanitized.** Colons/commas stripped, newlines/tabs escaped, BOM removed, whitespace trimmed.
-- **Quoted labels.** Use `"quotes"` for labels with spaces: `push "hello world" 0.12,...`
-- **CRC32 on save.** Pronounceable checksum word for quick visual verification.
-- **Same file format.** vec and vec-cpu read/write the same .tensors and .meta files.
+- **Brute force.** Every query scans every vector. Exact results, zero approximation.
+- **GPU top-K.** Above 100K vectors, a CUDA kernel finds the top results on GPU.
+- **All RAM.** Vectors in VRAM (or RAM for vec-cpu), labels and data alongside them. No mmap, no lazy paging — disk is touched only on startup load and explicit SAVE.
+- **Indices are permanent.** Slot 42 is always slot 42. Deletes are tombstones.
+- **Labels are clean.** ≤2048 bytes, no spaces, no `: * ? " < > | ,`. URI-style paths like `docs/file.pdf` are fine.
+- **Data is opaque.** ≤100KB per slot. VEC stores the bytes verbatim — sniff the mime on the client if you need to.
+- **Same file format across builds.** vec and vec-cpu read/write the same `.tensors`, `.meta`, `.data` files.
+- **CRC32 on save.** Pronounceable checksum word for eyeball integrity checks.
+- **Read-only mode.** If the file isn't writable, queries work, writes are rejected.
+- **Disk space check.** Saves skipped if insufficient space.
+- **File repair.** `--check` verifies, `--repair` fixes.
 
----
+## File format
 
-## Tested models
+```
+.tensors  [4B dim][4B count][4B deleted][1B fmt][count×1B alive][vectors][4B CRC32]
+.meta     [4B count][per slot: 4B len + label bytes]
+.data     [4B count][count×1B alive mask][per present slot: 4B len + bytes][4B CRC32]
+```
 
-| Model | Dimensions | Use |
-|---|---|---|
-| DINOv2 (dinov2_vitl14) | 1024 | Image embeddings |
-| BGE-large-en-v1.5 | 1024 | Text embeddings |
-| ArcFace | 512 | Face recognition |
-| MiniLM-L12-v2 | 384 | Multilingual text |
-
----
+`.data` is new in 2.0 and only created on save when at least one slot has a payload.
 
 ## Client SDKs
 
-Available in `sdk/` directory:
+C++ (`vec_client.h`), Python (`vec_client.py`), Node.js (`vec_client.js`), Delphi (`vec_client.pas`).
 
-- `vec_client.h` - C++
-- `vec_client.py` - Python
-- `vec_client.js` - Node.js
-- `vec_client.pas` - Delphi
+All in `sdk/`. Quick protocol reference in `sdk/README.md`. Byte-exact spec in `PROTOCOL-2.0.md`.
 
-All implement: `push`, `bpush`, `pull`, `cpull`, `bpull`, `bcpull`, `setLabel`, `delete`, `undo`, `save`, `size`, `dim`.
+## Tested with
+
+DINOv2 (1024d), BGE-large (1024d), ArcFace (512d), MiniLM-L12 (384d).
 
 ---
 
