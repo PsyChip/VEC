@@ -26,6 +26,14 @@
  *   int n = vec.get_batch(idx_array, idx_count, rs, 10);
  *   int n = vec.get("img/cat.jpg", rs, 10);
  *
+ *   // Exact-match lookup (returns 1 found / 0 not found / -1 error).
+ *   // Use to dedup-check before push, or fetch a record by content.
+ *   VecRecord r;
+ *   if (vec.exists(vec_f32, dim, &r, VEC_SHAPE_LABEL) == 1) {
+ *       printf("already at slot %d label=%s\n", r.index, r.label ? r.label : "");
+ *       vec_free_record(&r);
+ *   }
+ *
  *   for (int i = 0; i < n; i++) vec_free_record(&rs[i]);
  *
  *   vec.set_data(42, jpeg_bytes, jpeg_len);
@@ -97,6 +105,7 @@ typedef int vec_sock_t;
 #define VEC_CMD_QID       0x11
 #define VEC_CMD_SET_DATA  0x13
 #define VEC_CMD_GET_DATA  0x14
+#define VEC_CMD_EXISTS    0x15
 
 /* response status */
 #define VEC_RESP_OK  0x00
@@ -428,6 +437,59 @@ public:
         int rc = parse_records(resp, n, shape, dim, 1, out, max_records);
         free(resp);
         return rc;
+    }
+
+    /* EXISTS: byte-exact lookup by vector content.
+     * shape uses VEC_SHAPE_LABEL / VEC_SHAPE_DATA bits; SHAPE_VECTOR is ignored.
+     * returns 1 if found (fills *out — caller must vec_free_record), 0 if not, -1 on error. */
+    int exists(const float *vec, int dim, VecRecord *out) {
+        return exists(vec, dim, out, 0);
+    }
+    int exists(const float *vec, int dim, VecRecord *out, unsigned char shape) {
+        if (!vec || dim <= 0 || !out) return -1;
+        int vbytes = dim * (int)sizeof(float);
+        int blen = 1 + vbytes;
+        char *body = (char *)malloc(blen);
+        if (!body) return -1;
+        body[0] = (char)shape;
+        memcpy(body + 1, vec, vbytes);
+        send_frame(VEC_CMD_EXISTS, NULL, 0, body, blen);
+        free(body);
+        unsigned char *resp = NULL;
+        char err[128];
+        int n = recv_response(&resp, err, sizeof(err));
+        if (n < 0) return -1;
+        memset(out, 0, sizeof(*out));
+        if (n < 1) { free(resp); return -1; }
+        if (resp[0] == 0) { free(resp); return 0; }
+        if (n < 5) { free(resp); return -1; }
+        memcpy(&out->index, resp + 1, 4);
+        out->distance = 0.0f;
+        unsigned int p = 5;
+        if (shape & VEC_SHAPE_LABEL) {
+            if ((int)(p + 4) > n) { free(resp); vec_free_record(out); return -1; }
+            unsigned int ll; memcpy(&ll, resp + p, 4); p += 4;
+            if ((int)(p + ll) > n) { free(resp); vec_free_record(out); return -1; }
+            if (ll > 0) {
+                out->label = (char *)malloc(ll + 1);
+                if (out->label) { memcpy(out->label, resp + p, ll); out->label[ll] = '\0'; }
+                out->label_len = ll;
+            }
+            p += ll;
+        }
+        if (shape & VEC_SHAPE_DATA) {
+            if ((int)(p + 4) > n) { free(resp); vec_free_record(out); return -1; }
+            unsigned int dl; memcpy(&dl, resp + p, 4); p += 4;
+            if ((int)(p + dl) > n) { free(resp); vec_free_record(out); return -1; }
+            if (dl > 0) {
+                out->data = (unsigned char *)malloc(dl);
+                if (out->data) memcpy(out->data, resp + p, dl);
+                out->data_len = dl;
+            }
+            p += dl;
+        }
+        free(resp);
+        return 1;
     }
 
     /* GET single by index */

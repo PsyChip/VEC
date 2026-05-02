@@ -42,6 +42,7 @@
 #define CMD_QID       0x11
 #define CMD_SET_DATA  0x13
 #define CMD_GET_DATA  0x14
+#define CMD_EXISTS    0x15
 
 #define RESP_OK  0x00
 #define RESP_ERR 0x01
@@ -259,6 +260,7 @@ int main(int argc, char **argv) {
 
     float *vec  = (float *)malloc(vbytes);
     float *qvec = (float *)malloc(vbytes);
+    float *exists_vec = (float *)malloc(vbytes); /* saved copy of the plain push for EXISTS/dup tests */
     unsigned char *resp = NULL;
     unsigned int resp_len = 0;
     int status;
@@ -317,6 +319,7 @@ int main(int argc, char **argv) {
     /* (a) push without label or data */
     {
         for (int d = 0; d < dim; d++) vec[d] = randf();
+        memcpy(exists_vec, vec, vbytes); /* save for [2b] EXISTS / duplicate tests */
         int blen = vbytes + 4;
         memcpy(bodybuf, vec, vbytes);
         unsigned int zero = 0; memcpy(bodybuf + vbytes, &zero, 4);
@@ -425,6 +428,97 @@ int main(int argc, char **argv) {
         check("PUSH oversize-label rejected", status == RESP_ERR, m);
         free(resp);
     }
+
+    /* ======================================================
+     * 2b) EXISTS + duplicate PUSH rejection
+     * ====================================================== */
+     printf("[2b] CMD_EXISTS + duplicate PUSH\n");
+
+     /* (a) EXISTS hit on the plain push, shape=0 returns just <found><idx> */
+     {
+         int blen = 1 + vbytes;
+         bodybuf[0] = 0;
+         memcpy(bodybuf + 1, exists_vec, vbytes);
+         int flen = build_frame(frame, CMD_EXISTS, NULL, 0, bodybuf, blen);
+         status = rt("EXISTS-hit", frame, flen, &resp, &resp_len);
+         int ok = 0, got_idx = -1;
+         if (status == RESP_OK && resp_len == 5 && resp[0] == 1) {
+             memcpy(&got_idx, resp + 1, 4);
+             ok = (got_idx == idx_plain);
+         }
+         char m[64]; snprintf(m, sizeof(m), "found=%d idx=%d expected=%d", resp_len > 0 ? resp[0] : -1, got_idx, idx_plain);
+         check("EXISTS hit returns plain slot", ok, m);
+         free(resp);
+     }
+
+     /* (b) EXISTS miss with random vector */
+     {
+         int blen = 1 + vbytes;
+         bodybuf[0] = 0;
+         for (int d = 0; d < dim; d++) {
+             float r = randf();
+             memcpy(bodybuf + 1 + d * 4, &r, 4);
+         }
+         int flen = build_frame(frame, CMD_EXISTS, NULL, 0, bodybuf, blen);
+         status = rt("EXISTS-miss", frame, flen, &resp, &resp_len);
+         int ok = (status == RESP_OK && resp_len == 1 && resp[0] == 0);
+         check("EXISTS miss on random vector", ok, NULL);
+         free(resp);
+     }
+
+     /* (c) push a fresh known labeled vector and EXISTS-by-shape returns its label */
+     {
+         float *known = (float *)malloc(vbytes);
+         for (int d = 0; d < dim; d++) known[d] = randf();
+         {
+             int pblen = vbytes + 4;
+             memcpy(bodybuf, known, vbytes);
+             unsigned int zero = 0; memcpy(bodybuf + vbytes, &zero, 4);
+             const char *kl = "exists/test/labeled";
+             int flen = build_frame(frame, CMD_PUSH, kl, (int)strlen(kl), bodybuf, pblen);
+             status = rt("PUSH-for-exists-shape", frame, flen, &resp, &resp_len);
+             free(resp);
+         }
+         int blen = 1 + vbytes;
+         bodybuf[0] = SHAPE_LABEL;
+         memcpy(bodybuf + 1, known, vbytes);
+         int flen = build_frame(frame, CMD_EXISTS, NULL, 0, bodybuf, blen);
+         status = rt("EXISTS-shape-label", frame, flen, &resp, &resp_len);
+         int ok = 0;
+         char m[96] = {0};
+         if (status == RESP_OK && resp_len >= 5 && resp[0] == 1) {
+             unsigned int ll; memcpy(&ll, resp + 5, 4);
+             if (resp_len == 5 + 4 + ll && ll < 64) {
+                 char buf[64] = {0};
+                 memcpy(buf, resp + 9, ll);
+                 ok = (strcmp(buf, "exists/test/labeled") == 0);
+                 snprintf(m, sizeof(m), "label=\"%s\"", buf);
+             }
+         }
+         check("EXISTS shape=label returns label", ok, m);
+         free(resp);
+         free(known);
+     }
+
+     /* (d) duplicate PUSH rejection */
+     {
+         int blen = vbytes + 4;
+         memcpy(bodybuf, exists_vec, vbytes);
+         unsigned int zero = 0; memcpy(bodybuf + vbytes, &zero, 4);
+         int flen = build_frame(frame, CMD_PUSH, NULL, 0, bodybuf, blen);
+         status = rt("PUSH-err-dup", frame, flen, &resp, &resp_len);
+         int ok = 0;
+         char m[128] = {0};
+         if (status == RESP_ERR && resp_len > 0) {
+             /* expect "duplicate vector at index <N>" */
+             ok = (resp_len >= 17 && memcmp(resp, "duplicate vector", 16) == 0);
+             snprintf(m, sizeof(m), "err=\"%.*s\"", (int)(resp_len > 100 ? 100 : resp_len), (const char *)resp);
+         }
+         check("PUSH duplicate rejected", ok, m);
+         free(resp);
+     }
+
+     printf("\n");
 
     /* fresh random query */
     for (int d = 0; d < dim; d++) qvec[d] = randf();
@@ -843,6 +937,7 @@ int main(int argc, char **argv) {
     free(bodybuf);
     free(vec);
     free(qvec);
+    free(exists_vec);
     free(pushed_idx);
     free(data_blob);
     CloseHandle(g_pipe);

@@ -68,6 +68,7 @@ CMD_INFO      = 0x10
 CMD_QID       = 0x11
 CMD_SET_DATA  = 0x13
 CMD_GET_DATA  = 0x14
+CMD_EXISTS    = 0x15
 
 RESP_OK  = 0x00
 RESP_ERR = 0x01
@@ -221,6 +222,41 @@ class VecClient:
         body = bytes([METRIC_COSINE if cosine else METRIC_L2, shape & 0xFF]) + arr.tobytes()
         self._send_frame(CMD_QUERY, body=body)
         return self._decode_records(self._recv_response(), shape, self._dim(), with_distance=True)
+
+    def exists(self, vector, shape=0):
+        """Exact-match lookup by vector content.
+
+        Returns None if no match. Otherwise returns a dict
+        {'index': int, 'label': bytes|None, 'data': bytes|None}
+        with label/data populated only when requested via shape (SHAPE_LABEL,
+        SHAPE_DATA). SHAPE_VECTOR is ignored — caller already has the vector.
+        """
+        arr = np.asarray(vector, dtype=np.float32)
+        body = bytes([shape & 0xFF]) + arr.tobytes()
+        self._send_frame(CMD_EXISTS, body=body)
+        resp = self._recv_response()
+        if len(resp) < 1:
+            raise VecError("EXISTS: empty response")
+        if resp[0] == 0:
+            return None
+        if len(resp) < 5:
+            raise VecError("EXISTS: truncated response")
+        idx = struct.unpack("<i", resp[1:5])[0]
+        out = {'index': idx, 'label': None, 'data': None}
+        p = 5
+        if shape & SHAPE_LABEL:
+            if len(resp) < p + 4:
+                raise VecError("EXISTS: truncated label length")
+            ll = struct.unpack("<I", resp[p:p+4])[0]; p += 4
+            out['label'] = resp[p:p+ll].decode('utf-8', errors='replace') if ll > 0 else ''
+            p += ll
+        if shape & SHAPE_DATA:
+            if len(resp) < p + 4:
+                raise VecError("EXISTS: truncated data length")
+            dl = struct.unpack("<I", resp[p:p+4])[0]; p += 4
+            out['data'] = bytes(resp[p:p+dl]) if dl > 0 else b''
+            p += dl
+        return out
 
     def qid(self, index_or_label, cosine=False, shape=SHAPE_FULL):
         """Query using a stored vector as the source. Accepts int index or str label."""

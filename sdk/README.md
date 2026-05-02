@@ -83,6 +83,7 @@ A response body is `<4B u32 count>` followed by `count` records.
 | QID | `11` | `<1B metric><1B shape>[<4B idx>` or empty if label]` | top-K records (with distance) |
 | SET_DATA | `13` | `[<4B idx>]<4B u32 dlen>[data]` | empty |
 | GET_DATA | `14` | `<4B idx>` or empty (label) | `<4B u32 dlen>[data]` |
+| EXISTS | `15` | `<1B shape><vec>` | `<1B found>` then if found: `<4B i32 idx>` + optional `[lbl][data]` per shape |
 
 Removed: `0x03` (CPULL → use QUERY metric=1), `0x05` (MGET → use GET batch mode), `0x12` (CPID → use QID metric=1).
 Reserved: `0x0B`, `0x0C` (do not reuse).
@@ -91,7 +92,8 @@ Reserved: `0x0B`, `0x0C` (do not reuse).
 
 - **metric**: `0x00` = L2 (default), `0x01` = cosine. Other values → ERR.
 - **mode** (GET): `0x00` = single, `0x01` = batch.
-- **PUSH**: vector required; label optional via header; data optional in body but **requires label**. Caps: label ≤ 2048 bytes, data ≤ 102400 bytes.
+- **PUSH**: vector required; label optional via header; data optional in body but **requires label**. Caps: label ≤ 2048 bytes, data ≤ 102400 bytes. Bit-identical duplicates are rejected with `duplicate vector at index <N>`.
+- **EXISTS**: byte-exact lookup. Hash check + memcmp against the stored representation. Tombstoned slots are skipped. Shape bit `0x01` (vector) is meaningless and ignored — caller already supplied the vector.
 - **GET single by label** may return multiple records if the label is ambiguous.
 - **DELETE / UNDO** clear the label and data of the affected slot in addition to the vector.
 - **UPDATE** overwrites the vector only; use `LABEL` and `SET_DATA` for label/data changes.
@@ -131,6 +133,8 @@ ERR responses carry an ASCII message in the body. Common ones:
 | `label not found` | no slot with this label |
 | `deleted` / `already deleted` | tombstoned slot |
 | `read-only mode` | write command on read-only DB |
+| `duplicate vector at index <N>` | PUSH of a bit-identical vector — `<N>` is the existing slot |
+| `bad exists body` / `bad shape mask` | EXISTS body length wrong, or shape uses reserved bits |
 | `unknown binary command` | unrecognized CMD byte |
 
 Read-only rejects: PUSH, UPDATE, DELETE, LABEL, UNDO, SAVE, SET_DATA.
@@ -147,6 +151,7 @@ Read-only rejects: PUSH, UPDATE, DELETE, LABEL, UNDO, SAVE, SET_DATA.
 All clients expose:
 - `push(vec, label=None, data=None)` — vector + optional label + optional data
 - `query(vec, cosine=False, shape=FULL)` / `qid(idx_or_label, ...)` — kNN search
+- `exists(vec, shape=0)` — exact-match lookup; returns `(idx, label, data)` or `None`
 - `get(target, shape=FULL)` — single by index, single by label (may yield multiple), or batch
 - `set_data(idx_or_label, bytes)` / `get_data(idx_or_label)`
 - `update(idx_or_label, vec)` — vector only
@@ -163,7 +168,8 @@ All clients expose:
 ```
 .tensors  [4B dim][4B count][4B deleted][1B fmt][count×1B alive][vectors][4B CRC32]
 .meta     [4B count][per slot: 4B len + label bytes]
+.hashes   [4B count][count × 8B u64 xxh64][4B CRC32]
 .data     [4B count][count×1B alive mask][per present slot: 4B u32 dlen + data bytes][4B CRC32]
 ```
 
-`.tensors` and `.meta` are unchanged from 1.x — existing DBs load. `.data` is new in 2.0; absent file means "no blobs". Server creates `.data` on first SAVE if any slot has data.
+`.tensors` and `.meta` are unchanged from 1.x — existing DBs load. `.data` and `.hashes` are new in 2.0. `.data` absent means "no blobs". `.hashes` is the persisted dedup index; if missing or its CRC fails, the server rebuilds it from `.tensors` at startup.

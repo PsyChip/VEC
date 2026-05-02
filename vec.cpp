@@ -21,7 +21,7 @@
  *   response: <1B status> <4B body_len> [body]   ; status 0=OK, 1=ERR
  *   CMD: 01=push 02=query 04=get 06=update 07=delete 08=label
  *        09=undo 0A=save 0D=cluster 0E=distinct 0F=represent
- *        10=info 11=qid 13=set_data 14=get_data
+ *        10=info 11=qid 13=set_data 14=get_data 15=exists
  *
  * GPU top-K kernel for datasets above 100K entries.
  * Labels: filename-scheme, ≤2048 bytes, validated on write, lenient on load.
@@ -82,6 +82,9 @@
 #include <string.h>
 #include <time.h>
 #include <float.h>
+#include <stdint.h>
+#include <unordered_map>
+#include "xxhash.h"
 
 /* ===================================================================== */
 /*  Constants                                                            */
@@ -121,6 +124,7 @@
 /*      0x12            removed — was CPID */
 #define CMD_SET_DATA  0x13
 #define CMD_GET_DATA  0x14
+#define CMD_EXISTS    0x15
 
 /* response envelope */
 #define RESP_OK  0x00
@@ -272,6 +276,11 @@ static int g_labels_cap = 0;
 static unsigned char **g_blobs = NULL;  /* array of pointers, NULL = no blob */
 static unsigned int  *g_blob_lens = NULL; /* 0 if g_blobs[i] == NULL */
 static int g_blobs_cap = 0;
+
+/* hash index: xxh64 of stored vector bytes -> slot. multimap absorbs the rare
+ * collision; lookup walks all entries for a hash and byte-compares each.
+ * tombstoned slots are erased from the map on DELETE/UNDO so EXISTS skips them. */
+static std::unordered_multimap<uint64_t, uint32_t> g_hash_index;
 
 static int g_dirty = 0;
 static int g_readonly = 0;
@@ -451,6 +460,7 @@ static void gpu_shutdown() {
         free(g_blobs);
     }
     free(g_blob_lens);
+    g_hash_index.clear();
 }
 
 /* ===================================================================== */
@@ -530,6 +540,129 @@ static int vec_set_label(int slot, const char *label, int len) {
     return 0;
 }
 
+/* hash the f32 input as it would be stored on the GPU. for f16 DBs we convert
+ * each lane to IEEE-754 binary16 (round-toward-zero, finite range) and hash the
+ * resulting unsigned shorts. matches the bytes that GPU upload_and_store produces. */
+static uint64_t hash_input_as_stored(const float *h_vec) {
+    if (g_fmt == FMT_F32) {
+        return XXH64(h_vec, (size_t)g_dim * sizeof(float), 0);
+    }
+    /* f16 path: convert lane-by-lane to binary16. round-toward-zero matches
+     * the simplest GPU __float2half_rn-equivalent we need for hash agreement;
+     * exact bit pattern is what matters, the value's accuracy is irrelevant. */
+    static unsigned short *scratch = NULL;
+    static int scratch_dim = 0;
+    if (g_dim > scratch_dim) {
+        free(scratch);
+        scratch = (unsigned short *)malloc(g_dim * sizeof(unsigned short));
+        if (!scratch) return 0;
+        scratch_dim = g_dim;
+    }
+    for (int i = 0; i < g_dim; i++) {
+        unsigned int f;
+        memcpy(&f, &h_vec[i], sizeof(unsigned int));
+        unsigned int sign = (f >> 16) & 0x8000;
+        int exp32 = (int)((f >> 23) & 0xFF) - 127;
+        unsigned int mant32 = f & 0x7FFFFF;
+        unsigned short h;
+        if (exp32 == 128) {
+            /* inf/nan */
+            h = (unsigned short)(sign | 0x7C00 | (mant32 ? 0x0200 : 0));
+        } else if (exp32 > 15) {
+            h = (unsigned short)(sign | 0x7C00); /* overflow -> inf */
+        } else if (exp32 >= -14) {
+            h = (unsigned short)(sign | (((exp32 + 15) & 0x1F) << 10) | (mant32 >> 13));
+        } else if (exp32 >= -24) {
+            unsigned int m = (mant32 | 0x800000) >> (-(exp32 + 14));
+            h = (unsigned short)(sign | (m >> 13));
+        } else {
+            h = (unsigned short)sign; /* underflow -> signed zero */
+        }
+        scratch[i] = h;
+    }
+    return XXH64(scratch, (size_t)g_dim * sizeof(unsigned short), 0);
+}
+
+/* hash the stored vector bytes for an existing slot — reads from GPU. */
+static uint64_t hash_slot_stored(int slot) {
+    static unsigned char *buf = NULL;
+    static size_t buf_cap = 0;
+    size_t need = (size_t)g_dim * g_elem_size;
+    if (need > buf_cap) {
+        free(buf);
+        buf = (unsigned char *)malloc(need);
+        if (!buf) return 0;
+        buf_cap = need;
+    }
+    CUDA_CHECK(cudaMemcpy(buf, (char *)d_vectors + (size_t)slot * g_dim * g_elem_size,
+                          need, cudaMemcpyDeviceToHost));
+    return XXH64(buf, need, 0);
+}
+
+/* erase a (hash, slot) entry from the multimap. no-op if not present. */
+static void hash_index_erase(uint64_t hash, uint32_t slot) {
+    auto range = g_hash_index.equal_range(hash);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == slot) { g_hash_index.erase(it); return; }
+    }
+}
+
+/* find an alive slot whose stored bytes equal h_vec's stored form.
+ * returns slot index or -1 if no match. caller supplies the input hash. */
+static int hash_index_find_match(uint64_t hash, const float *h_vec) {
+    auto range = g_hash_index.equal_range(hash);
+    if (range.first == range.second) return -1;
+    /* compare by byte-exact stored form. read each candidate's GPU bytes
+     * and memcmp against the same encoding of h_vec. */
+    static unsigned char *cand = NULL;   /* candidate slot bytes */
+    static unsigned char *want = NULL;   /* h_vec encoded as stored */
+    static size_t cap = 0;
+    size_t need = (size_t)g_dim * g_elem_size;
+    if (need > cap) {
+        free(cand); free(want);
+        cand = (unsigned char *)malloc(need);
+        want = (unsigned char *)malloc(need);
+        if (!cand || !want) { cap = 0; return -1; }
+        cap = need;
+    }
+    /* build "want" buffer: f32 just memcpy, f16 use the same convert as hash_input_as_stored */
+    if (g_fmt == FMT_F32) {
+        memcpy(want, h_vec, need);
+    } else {
+        unsigned short *w16 = (unsigned short *)want;
+        for (int i = 0; i < g_dim; i++) {
+            unsigned int f;
+            memcpy(&f, &h_vec[i], sizeof(unsigned int));
+            unsigned int sign = (f >> 16) & 0x8000;
+            int exp32 = (int)((f >> 23) & 0xFF) - 127;
+            unsigned int mant32 = f & 0x7FFFFF;
+            unsigned short h;
+            if (exp32 == 128) {
+                h = (unsigned short)(sign | 0x7C00 | (mant32 ? 0x0200 : 0));
+            } else if (exp32 > 15) {
+                h = (unsigned short)(sign | 0x7C00);
+            } else if (exp32 >= -14) {
+                h = (unsigned short)(sign | (((exp32 + 15) & 0x1F) << 10) | (mant32 >> 13));
+            } else if (exp32 >= -24) {
+                unsigned int m = (mant32 | 0x800000) >> (-(exp32 + 14));
+                h = (unsigned short)(sign | (m >> 13));
+            } else {
+                h = (unsigned short)sign;
+            }
+            w16[i] = h;
+        }
+    }
+    for (auto it = range.first; it != range.second; ++it) {
+        uint32_t slot = it->second;
+        if ((int)slot >= g_count) continue;
+        if (!g_alive[slot]) continue;
+        CUDA_CHECK(cudaMemcpy(cand, (char *)d_vectors + (size_t)slot * g_dim * g_elem_size,
+                              need, cudaMemcpyDeviceToHost));
+        if (memcmp(cand, want, need) == 0) return (int)slot;
+    }
+    return -1;
+}
+
 /* set blob — opaque bytes, no validation beyond length cap. len=0 clears. */
 static int vec_set_blob(int slot, const unsigned char *bytes, unsigned int len) {
     if (slot < 0 || slot >= g_blobs_cap) return -1;
@@ -558,6 +691,7 @@ static int vec_push(const float *h_vec) {
     upload_and_store(h_vec, (char *)d_vectors + (size_t)slot * g_dim * g_elem_size, g_dim);
     g_count++;
     g_dirty = 1; g_last_write = time(NULL);
+    g_hash_index.insert({hash_input_as_stored(h_vec), (uint32_t)slot});
     return slot;
 }
 
@@ -1175,7 +1309,8 @@ static long long estimate_file_size() {
     long long meta = 4; /* count header */
     for (int i = 0; i < g_count; i++)
         meta += 4 + (g_labels[i] ? (long long)strlen(g_labels[i]) : 0);
-    return tensors + meta;
+    long long hashes = 4 + (long long)g_count * 8 + 4;
+    return tensors + meta + hashes;
 }
 
 static void save_to_file(int already_locked) {
@@ -1296,6 +1431,33 @@ static void save_to_file(int already_locked) {
                 if (slen > 0) fwrite(g_labels[i], 1, slen, mf);
             }
             fclose(mf);
+        }
+    }
+
+    /* save hash index to .hashes sidecar.
+     * format: <4B count><count × 8B u64 hash><4B crc32>
+     * hash is 0 for deleted slots (entry not in multimap). */
+    {
+        char hashpath[512];
+        strncpy(hashpath, g_filepath, sizeof(hashpath) - 1);
+        char *ext = strstr(hashpath, ".tensors");
+        if (ext) strcpy(ext, ".hashes");
+        else snprintf(hashpath, sizeof(hashpath), "%s.hashes", g_name);
+
+        FILE *hf = fopen(hashpath, "wb");
+        if (hf) {
+            uint64_t *arr = (uint64_t *)calloc(g_count, sizeof(uint64_t));
+            if (arr) {
+                for (auto &kv : g_hash_index) {
+                    if ((int)kv.second < g_count) arr[kv.second] = kv.first;
+                }
+                fwrite(&g_count, sizeof(int), 1, hf);
+                fwrite(arr, sizeof(uint64_t), g_count, hf);
+                unsigned int hcrc = crc32_update(0, arr, (size_t)g_count * sizeof(uint64_t));
+                fwrite(&hcrc, sizeof(unsigned int), 1, hf);
+                free(arr);
+            }
+            fclose(hf);
         }
     }
 
@@ -1483,6 +1645,49 @@ static int load_from_file() {
         fclose(df);
     }
 
+    /* load hash index from .hashes sidecar; on missing or CRC mismatch, rebuild from .tensors */
+    g_hash_index.clear();
+    int hashes_loaded = 0;
+    {
+        char hashpath[512];
+        strncpy(hashpath, g_filepath, sizeof(hashpath) - 1);
+        char *hext = strstr(hashpath, ".tensors");
+        if (hext) strcpy(hext, ".hashes");
+        else snprintf(hashpath, sizeof(hashpath), "%s.hashes", g_name);
+
+        FILE *hf = fopen(hashpath, "rb");
+        if (hf) {
+            int hcount = 0;
+            if (fread(&hcount, sizeof(int), 1, hf) == 1 && hcount == g_count && hcount >= 0) {
+                uint64_t *arr = (uint64_t *)malloc((size_t)hcount * sizeof(uint64_t));
+                unsigned int stored_crc = 0;
+                if (arr &&
+                    fread(arr, sizeof(uint64_t), (size_t)hcount, hf) == (size_t)hcount &&
+                    fread(&stored_crc, sizeof(unsigned int), 1, hf) == 1) {
+                    unsigned int calc_crc = crc32_update(0, arr, (size_t)hcount * sizeof(uint64_t));
+                    if (calc_crc == stored_crc) {
+                        for (int i = 0; i < hcount; i++) {
+                            if (g_alive[i] && arr[i] != 0) {
+                                g_hash_index.insert({arr[i], (uint32_t)i});
+                            }
+                        }
+                        hashes_loaded = 1;
+                    } else {
+                        fprintf(stderr, "WARN: .hashes crc mismatch, rebuilding from .tensors\n");
+                    }
+                }
+                free(arr);
+            }
+            fclose(hf);
+        }
+    }
+    if (!hashes_loaded && g_count > 0) {
+        for (int i = 0; i < g_count; i++) {
+            if (!g_alive[i]) continue;
+            g_hash_index.insert({hash_slot_stored(i), (uint32_t)i});
+        }
+    }
+
     return 1;
 }
 
@@ -1532,6 +1737,7 @@ static int frame_data_len(unsigned char cmd, const char *data_start, int availab
         case CMD_QID:
         case CMD_SET_DATA:
         case CMD_GET_DATA:
+        case CMD_EXISTS:
             if (available < 4) return -1;
             unsigned int blen;
             memcpy(&blen, data_start, 4);
@@ -1772,6 +1978,15 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
             if (rc == -2) { resp_err(writer, wctx, "label too long"); return 0; }
             if (rc == -3) { resp_err(writer, wctx, "label empty"); return 0; }
         }
+        /* dedup: hash input, look for an alive slot with byte-identical stored form */
+        uint64_t in_hash = hash_input_as_stored((const float *)data);
+        int dup = hash_index_find_match(in_hash, (const float *)data);
+        if (dup >= 0) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "duplicate vector at index %d", dup);
+            resp_err(writer, wctx, msg);
+            return 0;
+        }
         int slot = vec_push((const float *)data);
         if (label_len > 0) {
             if (vec_set_label(slot, label, label_len) != 0) {
@@ -1909,7 +2124,10 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
         }
         if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
         if (!g_alive[idx]) { resp_err(writer, wctx, "deleted"); return 0; }
+        /* hash index: erase old entry before overwriting GPU bytes, insert new after */
+        hash_index_erase(hash_slot_stored(idx), (uint32_t)idx);
         upload_and_store(vec_data, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim);
+        g_hash_index.insert({hash_input_as_stored(vec_data), (uint32_t)idx});
         g_dirty = 1; g_last_write = time(NULL);
         resp_ok_empty(writer, wctx);
         return 0;
@@ -1928,6 +2146,7 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
         }
         if (idx < 0 || idx >= g_count) { resp_err(writer, wctx, "index out of range"); return 0; }
         if (!g_alive[idx]) { resp_err(writer, wctx, "already deleted"); return 0; }
+        hash_index_erase(hash_slot_stored(idx), (uint32_t)idx);
         g_alive[idx] = 0;
         g_deleted++;
         g_dirty = 1; g_last_write = time(NULL);
@@ -1960,6 +2179,10 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
     case CMD_UNDO: {
         if (data_len != 0) { resp_err(writer, wctx, "extra body bytes"); return 0; }
         if (g_count == 0) { resp_err(writer, wctx, "empty"); return 0; }
+        int popped = g_count - 1;
+        /* erase hash entry: if slot was alive its hash is in the index;
+         * if tombstoned (DELETE before UNDO), the entry was already removed. */
+        if (g_alive[popped]) hash_index_erase(hash_slot_stored(popped), (uint32_t)popped);
         g_count--;
         if (!g_alive[g_count]) g_deleted--;
         g_alive[g_count] = 1;
@@ -2102,6 +2325,51 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
         resp_ok_header(writer, wctx, 4 + dlen);
         writer(wctx, (const char *)&dlen, 4);
         if (dlen > 0) writer(wctx, (const char *)g_blobs[idx], (int)dlen);
+        return 0;
+    }
+
+    case CMD_EXISTS: {
+        /* body: 1B shape + vec(dim*4). returns 1B found, then if found:
+         *   <4B i32 index> + optional label/data per shape mask (bit 0x02, 0x04). */
+        int vbytes = g_dim * (int)sizeof(float);
+        if (data_len != 1 + vbytes) { resp_err(writer, wctx, "bad exists body"); return 0; }
+        unsigned char shape = (unsigned char)data[0];
+        if (shape & ~(SHAPE_VECTOR | SHAPE_LABEL | SHAPE_DATA)) {
+            resp_err(writer, wctx, "bad shape mask"); return 0;
+        }
+        const float *qvec = (const float *)(data + 1);
+        uint64_t qhash = hash_input_as_stored(qvec);
+        int idx = hash_index_find_match(qhash, qvec);
+        if (idx < 0) {
+            unsigned char zero = 0;
+            resp_ok_header(writer, wctx, 1);
+            writer(wctx, (const char *)&zero, 1);
+            return 0;
+        }
+        /* found: build body. SHAPE_VECTOR is meaningless here (caller has it) — ignored. */
+        unsigned int label_blen = 0, data_blen = 0;
+        if (shape & SHAPE_LABEL) {
+            label_blen = (idx < g_labels_cap && g_labels[idx]) ? (unsigned int)strlen(g_labels[idx]) : 0;
+        }
+        if (shape & SHAPE_DATA) {
+            data_blen = (idx < g_blobs_cap && g_blobs[idx]) ? g_blob_lens[idx] : 0;
+        }
+        unsigned int total = 1 + 4;
+        if (shape & SHAPE_LABEL) total += 4 + label_blen;
+        if (shape & SHAPE_DATA)  total += 4 + data_blen;
+        resp_ok_header(writer, wctx, total);
+        unsigned char one = 1;
+        writer(wctx, (const char *)&one, 1);
+        int out_idx = idx;
+        writer(wctx, (const char *)&out_idx, 4);
+        if (shape & SHAPE_LABEL) {
+            writer(wctx, (const char *)&label_blen, 4);
+            if (label_blen > 0) writer(wctx, g_labels[idx], (int)label_blen);
+        }
+        if (shape & SHAPE_DATA) {
+            writer(wctx, (const char *)&data_blen, 4);
+            if (data_blen > 0) writer(wctx, (const char *)g_blobs[idx], (int)data_blen);
+        }
         return 0;
     }
 

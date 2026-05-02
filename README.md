@@ -30,7 +30,7 @@ request:  F0 <2B ns_len> [ns] <CMD> <2B label_len> [label] <4B body_len> [body]
 response: <1B status> <4B body_len> [body]        ; status 0=ok, 1=err
 ```
 
-15 commands, one envelope. See `PROTOCOL-2.0.md` for the byte-exact spec or `sdk/README.md` for the quick reference.
+16 commands, one envelope. See `PROTOCOL-2.0.md` for the byte-exact spec or `sdk/README.md` for the quick reference.
 
 Use the SDK libraries — there is no text interface.
 
@@ -38,9 +38,10 @@ Use the SDK libraries — there is no text interface.
 
 ## What it does
 
-- **PUSH** — store a vector, optionally with a label and a ≤100KB data payload (data requires label). Returns the slot index.
+- **PUSH** — store a vector, optionally with a label and a ≤100KB data payload (data requires label). Returns the slot index. Rejects bit-identical duplicates.
 - **QUERY** — nearest-neighbor search; metric byte selects L2 or cosine.
 - **QID** — like QUERY but the query is an existing stored vector (by index or label).
+- **EXISTS** — exact-match lookup by vector content. Returns the slot index (and optional label/data) if present, `found=0` otherwise.
 - **GET** — retrieve records by index, by label (may yield multiple), or batch by index list.
 - **SET_DATA / GET_DATA** — manage the per-slot payload independently of the vector.
 - **UPDATE** — overwrite a vector in place (label and data untouched).
@@ -196,6 +197,7 @@ Requires NVIDIA CUDA Toolkit 12.x for `vec`. `vec-cpu` just needs a C++ compiler
 - **Brute force.** Every query scans every vector. Exact results, zero approximation.
 - **GPU top-K.** Above 100K vectors, a CUDA kernel finds the top results on GPU.
 - **All RAM.** Vectors in VRAM (or RAM for vec-cpu), labels and data alongside them. No mmap, no lazy paging — disk is touched only on startup load and explicit SAVE.
+- **Append-time dedup.** Every PUSH is hashed (xxh64 over stored bytes) and byte-compared against existing alive slots; bit-identical vectors are rejected with the existing slot's index. EXISTS exposes the same lookup as a query op.
 - **Indices are permanent.** Slot 42 is always slot 42. Deletes are tombstones.
 - **Labels are clean.** ≤2048 bytes, no spaces, no `: * ? " < > | ,`. URI-style paths like `docs/file.pdf` are fine.
 - **Data is opaque.** ≤100KB per slot. VEC stores the bytes verbatim — sniff the mime on the client if you need to.
@@ -210,10 +212,11 @@ Requires NVIDIA CUDA Toolkit 12.x for `vec`. `vec-cpu` just needs a C++ compiler
 ```
 .tensors  [4B dim][4B count][4B deleted][1B fmt][count×1B alive][vectors][4B CRC32]
 .meta     [4B count][per slot: 4B len + label bytes]
+.hashes   [4B count][count × 8B u64 xxh64 hash][4B CRC32]
 .data     [4B count][count×1B alive mask][per present slot: 4B len + bytes][4B CRC32]
 ```
 
-`.data` is new in 2.0 and only created on save when at least one slot has a payload.
+`.data` and `.hashes` are new in 2.0. `.data` is only written when at least one slot has a payload. `.hashes` is the persisted dedup index — if missing or its CRC fails, it's rebuilt from `.tensors` at startup.
 
 ## Client SDKs
 

@@ -64,6 +64,7 @@ const CMD_INFO      = 0x10;
 const CMD_QID       = 0x11;
 const CMD_SET_DATA  = 0x13;
 const CMD_GET_DATA  = 0x14;
+const CMD_EXISTS    = 0x15;
 
 const RESP_OK  = 0x00;
 const RESP_ERR = 0x01;
@@ -224,6 +225,35 @@ class VecClient {
         this._sendFrame(CMD_QUERY, Buffer.alloc(0), Buffer.concat([head, vecBuf]));
         const body = await this._recvResponse();
         return this._decodeRecords(body, shape, await this._dim(), true);
+    }
+
+    /** Exact-match lookup by vector content. Returns null if not found,
+     *  otherwise { index, label?, data? } with label/data populated only
+     *  when shape includes them. SHAPE_VECTOR is meaningless and ignored. */
+    async exists(vector, opts = {}) {
+        const { shape = 0 } = opts;
+        const vecBuf = this._vecToBuffer(vector);
+        const head = Buffer.from([shape & 0xFF]);
+        this._sendFrame(CMD_EXISTS, Buffer.alloc(0), Buffer.concat([head, vecBuf]));
+        const body = await this._recvResponse();
+        if (body.length < 1) throw new Error('EXISTS: empty response');
+        if (body[0] === 0) return null;
+        if (body.length < 5) throw new Error('EXISTS: truncated response');
+        const out = { index: body.readInt32LE(1) };
+        let p = 5;
+        if (shape & SHAPE_LABEL) {
+            if (body.length < p + 4) throw new Error('EXISTS: truncated label length');
+            const ll = body.readUInt32LE(p); p += 4;
+            out.label = ll > 0 ? body.slice(p, p + ll).toString('utf8') : '';
+            p += ll;
+        }
+        if (shape & SHAPE_DATA) {
+            if (body.length < p + 4) throw new Error('EXISTS: truncated data length');
+            const dl = body.readUInt32LE(p); p += 4;
+            out.data = dl > 0 ? body.slice(p, p + dl) : Buffer.alloc(0);
+            p += dl;
+        }
+        return out;
     }
 
     async qid(indexOrLabel, opts = {}) {

@@ -68,6 +68,7 @@ const
   VEC_CMD_QID       = $11;
   VEC_CMD_SET_DATA  = $13;
   VEC_CMD_GET_DATA  = $14;
+  VEC_CMD_EXISTS    = $15;
 
   VEC_RESP_OK  = $00;
   VEC_RESP_ERR = $01;
@@ -99,6 +100,13 @@ type
   end;
 
   TVecRecords = array of TVecRecord;
+
+  TVecExistsResult = record
+    Found    : Boolean;
+    Index    : Integer;
+    Label_   : string;       { empty if shape excluded label }
+    Data     : TByteArray;   { nil if shape excluded data }
+  end;
 
   TVecInfo = record
     Dim             : Integer;
@@ -147,6 +155,8 @@ type
     function Get(Index: Integer; Shape: Byte = VEC_SHAPE_FULL): TVecRecords;
     function GetByLabel(const ALabel: string; Shape: Byte = VEC_SHAPE_FULL): TVecRecords;
     function GetBatch(const Indices: array of Integer; Shape: Byte = VEC_SHAPE_FULL): TVecRecords;
+
+    function Exists(const Vec: TSingleArray; Shape: Byte = 0): TVecExistsResult;
 
     procedure SetData(Index: Integer; const Data: TByteArray); overload;
     procedure SetData(const ALabel: string; const Data: TByteArray); overload;
@@ -541,6 +551,50 @@ begin
   SendFrame(VEC_CMD_GET, '', Body);
   R := RecvResponse;
   Result := ParseRecords(R, Shape, Dim, False);
+end;
+
+{ ---------------- EXISTS ---------------- }
+
+function TVecClient.Exists(const Vec: TSingleArray; Shape: Byte): TVecExistsResult;
+var Body, R: AnsiString; VBytes: Integer; LL, DL: Cardinal; P: Integer;
+begin
+  Result.Found := False;
+  Result.Index := -1;
+  Result.Label_ := '';
+  Result.Data := nil;
+  VBytes := Length(Vec) * SizeOf(Single);
+  SetLength(Body, 1 + VBytes);
+  Body[1] := AnsiChar(Shape);
+  if VBytes > 0 then Move(Vec[0], Body[2], VBytes);
+  SendFrame(VEC_CMD_EXISTS, '', Body);
+  R := RecvResponse;
+  if Length(R) < 1 then raise Exception.Create('EXISTS: empty response');
+  if Byte(R[1]) = 0 then Exit;
+  if Length(R) < 5 then raise Exception.Create('EXISTS: truncated response');
+  Result.Found := True;
+  Move(R[2], Result.Index, 4);
+  P := 6; { 1-based, after found(1) + index(4) }
+  if (Shape and VEC_SHAPE_LABEL) <> 0 then
+  begin
+    if Length(R) < P + 3 then raise Exception.Create('EXISTS: truncated label length');
+    Move(R[P], LL, 4); Inc(P, 4);
+    if LL > 0 then
+    begin
+      Result.Label_ := string(Copy(R, P, LL));
+      Inc(P, LL);
+    end;
+  end;
+  if (Shape and VEC_SHAPE_DATA) <> 0 then
+  begin
+    if Length(R) < P + 3 then raise Exception.Create('EXISTS: truncated data length');
+    Move(R[P], DL, 4); Inc(P, 4);
+    if DL > 0 then
+    begin
+      SetLength(Result.Data, DL);
+      Move(R[P], Result.Data[0], DL);
+      Inc(P, DL);
+    end;
+  end;
 end;
 
 { ---------------- SET_DATA / GET_DATA ---------------- }
