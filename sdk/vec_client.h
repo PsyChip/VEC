@@ -4,9 +4,13 @@
  * VEC 2.0 is a clean break from 1.x. SDKs from 1.x are not wire-compatible.
  * See PROTOCOL-2.0.md for the full spec.
  *
+ * Local transport only in this version:
+ *   - Windows: named pipe   \\.\pipe\vec_<name>
+ *   - Linux:   unix socket  /tmp/vec_<name>.sock
+ *
  * Usage:
  *   VecClient vec;
- *   vec.connect_tcp("localhost", 1920);
+ *   vec.connect("tools");
  *
  *   // Push: vector required; data requires a label
  *   int idx = vec.push(vec_f32, dim);
@@ -52,10 +56,8 @@
  *
  *   vec.close();
  *
- * Router mode:
- *   vec.setNamespace("tools");
- *
- * Build: link with ws2_32.lib (Windows) or nothing extra (Linux)
+ * Build: nothing extra needed on Linux; on Windows link with no socket libs
+ * (this SDK uses the named-pipe API only).
  */
 #ifndef VEC_CLIENT_H
 #define VEC_CLIENT_H
@@ -63,22 +65,14 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-typedef SOCKET vec_sock_t;
-#define VEC_INVALID_SOCK INVALID_SOCKET
-#define vec_close_sock closesocket
+typedef HANDLE vec_handle_t;
+#define VEC_INVALID_HANDLE INVALID_HANDLE_VALUE
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <unistd.h>
-typedef int vec_sock_t;
-#define VEC_INVALID_SOCK -1
-#define vec_close_sock ::close
+typedef int vec_handle_t;
+#define VEC_INVALID_HANDLE -1
 #endif
 
 #include <stdio.h>
@@ -148,6 +142,35 @@ inline void vec_free_record(VecRecord *r) {
     free(r->vector); r->vector = NULL; r->dim       = 0;
 }
 
+/* one DBSCAN cluster: member slot indices + arithmetic-mean centroid. */
+struct VecCluster {
+    int *members;            /* malloc'd, member_count entries */
+    int member_count;
+    float *centroid;         /* malloc'd, dim entries (fp32) */
+    int dim;
+};
+
+struct VecClusterResult {
+    VecCluster *clusters;    /* malloc'd, cluster_count entries */
+    int cluster_count;
+    int *noise;              /* malloc'd, noise_count entries */
+    int noise_count;
+};
+
+inline void vec_free_cluster_result(VecClusterResult *r) {
+    if (!r) return;
+    if (r->clusters) {
+        for (int i = 0; i < r->cluster_count; i++) {
+            free(r->clusters[i].members);
+            free(r->clusters[i].centroid);
+        }
+        free(r->clusters);
+    }
+    free(r->noise);
+    r->clusters = NULL; r->cluster_count = 0;
+    r->noise = NULL;    r->noise_count = 0;
+}
+
 struct VecInfo {
     int dim;
     int count;
@@ -161,15 +184,38 @@ struct VecInfo {
 };
 
 class VecClient {
-    vec_sock_t sock;
+    vec_handle_t handle;
     char ns_buf[128];
     int ns_len;
     int dim_cache;
 
+#ifdef _WIN32
     int recv_exact(void *buf, int len) {
         int total = 0;
         while (total < len) {
-            int r = recv(sock, (char *)buf + total, len - total, 0);
+            DWORD got = 0;
+            if (!ReadFile(handle, (char *)buf + total, len - total, &got, NULL)) return -1;
+            if (got == 0) return -1;
+            total += (int)got;
+        }
+        return total;
+    }
+
+    int send_all(const char *data, int len) {
+        int sent = 0;
+        while (sent < len) {
+            DWORD wrote = 0;
+            if (!WriteFile(handle, data + sent, len - sent, &wrote, NULL)) return -1;
+            if (wrote == 0) return -1;
+            sent += (int)wrote;
+        }
+        return sent;
+    }
+#else
+    int recv_exact(void *buf, int len) {
+        int total = 0;
+        while (total < len) {
+            int r = (int)::recv(handle, (char *)buf + total, len - total, 0);
             if (r <= 0) return -1;
             total += r;
         }
@@ -179,12 +225,13 @@ class VecClient {
     int send_all(const char *data, int len) {
         int sent = 0;
         while (sent < len) {
-            int r = send(sock, data + sent, len - sent, 0);
+            int r = (int)::send(handle, data + sent, len - sent, 0);
             if (r <= 0) return -1;
             sent += r;
         }
         return sent;
     }
+#endif
 
     /* build and send a 2.0 binary frame: F0 <2B ns_len> [ns] <CMD> <2B label_len> [label] <4B body_len> [body] */
     int send_frame(unsigned char cmd, const char *label, int label_len,
@@ -288,61 +335,36 @@ class VecClient {
     }
 
 public:
-    VecClient() : sock(VEC_INVALID_SOCK), ns_len(0), dim_cache(0) { ns_buf[0] = '\0'; }
+    VecClient() : handle(VEC_INVALID_HANDLE), ns_len(0), dim_cache(0) { ns_buf[0] = '\0'; }
 
-    void setNamespace(const char *ns) {
-        if (ns && ns[0]) {
-            ns_len = (int)strlen(ns);
-            if (ns_len > (int)sizeof(ns_buf) - 1) ns_len = (int)sizeof(ns_buf) - 1;
-            memcpy(ns_buf, ns, ns_len);
-            ns_buf[ns_len] = '\0';
-        } else {
-            ns_len = 0;
-            ns_buf[0] = '\0';
-        }
-    }
-
-    int connect_tcp(const char *host, int port) {
+    /* Connect to the local instance named <name>:
+       Windows -> named pipe   \\.\pipe\vec_<name>
+       Linux   -> unix socket  /tmp/vec_<name>.sock
+       Returns 0 on success, -1 on failure. */
+    int connect(const char *name) {
+        if (!name || !name[0]) return -1;
 #ifdef _WIN32
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
-        sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == VEC_INVALID_SOCK) return -1;
-
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((unsigned short)port);
-
-        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-            struct hostent *he = gethostbyname(host);
-            if (!he) { vec_close_sock(sock); sock = VEC_INVALID_SOCK; return -1; }
-            memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-        }
-
-        if (::connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            vec_close_sock(sock); sock = VEC_INVALID_SOCK; return -1;
-        }
+        char path[256];
+        snprintf(path, sizeof(path), "\\\\.\\pipe\\vec_%s", name);
+        handle = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                             0, NULL, OPEN_EXISTING, 0, NULL);
+        if (handle == INVALID_HANDLE_VALUE) return -1;
         return 0;
-    }
-
-#ifndef _WIN32
-    int connect_unix(const char *name) {
+#else
         char path[256];
         snprintf(path, sizeof(path), "/tmp/vec_%s.sock", name);
-        sock = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sock < 0) return -1;
+        handle = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (handle < 0) { handle = VEC_INVALID_HANDLE; return -1; }
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-        if (::connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            ::close(sock); sock = VEC_INVALID_SOCK; return -1;
+        if (::connect(handle, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            ::close(handle); handle = VEC_INVALID_HANDLE; return -1;
         }
         return 0;
-    }
 #endif
+    }
 
     /* PUSH variants */
 
@@ -716,16 +738,69 @@ public:
         return 0;
     }
 
-    /* cluster/distinct/represent — body remains legacy text inside binary envelope.
-       caller gets a text dump in out_buf (NUL-terminated, truncated). */
-    int cluster_raw(float eps, int cosine, int min_pts, char *out_buf, int out_size) {
+    /* DBSCAN clustering. Caller frees with vec_free_cluster_result().
+     * Returns 0 on success, -1 on error. The centroid of each cluster is the
+     * arithmetic mean of its member vectors (fp32 even for f16 DBs). Useful for
+     * spotting degenerate-attractor clusters: clusters whose centroid magnitude
+     * is suspiciously small, or whose members have high pairwise distance, often
+     * contain low-confidence/fallback embeddings rather than a real coherent group. */
+    int cluster(float eps, int cosine, int min_pts, VecClusterResult *out) {
+        if (!out) return -1;
+        memset(out, 0, sizeof(*out));
+        int dim = ensure_dim();
+        if (dim < 0) return -1;
         char body[9];
         memcpy(body, &eps, 4);
         body[4] = (char)(cosine ? VEC_METRIC_COSINE : VEC_METRIC_L2);
         memcpy(body + 5, &min_pts, 4);
         send_frame(VEC_CMD_CLUSTER, NULL, 0, body, 9);
-        return copy_text_body(out_buf, out_size);
+        unsigned char *resp = NULL;
+        char err[128];
+        int n = recv_response(&resp, err, sizeof(err));
+        if (n < 0) { free(resp); return -1; }
+        int off = 0;
+        if (off + 4 > n) { free(resp); return -1; }
+        unsigned int cc; memcpy(&cc, resp + off, 4); off += 4;
+        out->cluster_count = (int)cc;
+        if (cc > 0) {
+            out->clusters = (VecCluster *)calloc(cc, sizeof(VecCluster));
+            if (!out->clusters) { free(resp); return -1; }
+        }
+        for (unsigned int c = 0; c < cc; c++) {
+            if (off + 4 > n) { vec_free_cluster_result(out); free(resp); return -1; }
+            unsigned int mc; memcpy(&mc, resp + off, 4); off += 4;
+            VecCluster *cl = &out->clusters[c];
+            cl->member_count = (int)mc;
+            cl->dim = dim;
+            if (mc > 0) {
+                if (off + (int)(mc * 4) > n) { vec_free_cluster_result(out); free(resp); return -1; }
+                cl->members = (int *)malloc(mc * sizeof(int));
+                if (!cl->members) { vec_free_cluster_result(out); free(resp); return -1; }
+                memcpy(cl->members, resp + off, mc * 4);
+                off += (int)(mc * 4);
+            }
+            if (off + dim * (int)sizeof(float) > n) { vec_free_cluster_result(out); free(resp); return -1; }
+            cl->centroid = (float *)malloc((size_t)dim * sizeof(float));
+            if (!cl->centroid) { vec_free_cluster_result(out); free(resp); return -1; }
+            memcpy(cl->centroid, resp + off, (size_t)dim * sizeof(float));
+            off += dim * (int)sizeof(float);
+        }
+        if (off + 4 > n) { vec_free_cluster_result(out); free(resp); return -1; }
+        unsigned int nc; memcpy(&nc, resp + off, 4); off += 4;
+        out->noise_count = (int)nc;
+        if (nc > 0) {
+            if (off + (int)(nc * 4) > n) { vec_free_cluster_result(out); free(resp); return -1; }
+            out->noise = (int *)malloc(nc * sizeof(int));
+            if (!out->noise) { vec_free_cluster_result(out); free(resp); return -1; }
+            memcpy(out->noise, resp + off, nc * 4);
+            off += (int)(nc * 4);
+        }
+        free(resp);
+        return 0;
     }
+
+    /* distinct/represent — body remains legacy text inside binary envelope.
+       caller gets a text dump in out_buf (NUL-terminated, truncated). */
     int distinct_raw(int k, int cosine, char *out_buf, int out_size) {
         char body[5];
         memcpy(body, &k, 4);
@@ -766,9 +841,13 @@ public:
     }
 
     void close() {
-        if (sock != VEC_INVALID_SOCK) {
-            vec_close_sock(sock);
-            sock = VEC_INVALID_SOCK;
+        if (handle != VEC_INVALID_HANDLE) {
+#ifdef _WIN32
+            CloseHandle(handle);
+#else
+            ::close(handle);
+#endif
+            handle = VEC_INVALID_HANDLE;
         }
     }
 };

@@ -80,6 +80,43 @@
 #include <math.h>
 #include <float.h>
 
+/* TCP keepalive on accepted sockets — see vec.cpp for rationale.
+   Probes start at 60s idle, fire every 10s up to 5 times. */
+#ifdef _WIN32
+#ifndef SIO_KEEPALIVE_VALS
+#define SIO_KEEPALIVE_VALS 0x98000004
+#endif
+static void set_keepalive(SOCKET s) {
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
+    struct tcp_keepalive {
+        ULONG onoff;
+        ULONG keepalivetime;
+        ULONG keepaliveinterval;
+    } kv = { 1, 60000, 10000 };
+    DWORD ret = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &kv, sizeof(kv), NULL, 0, &ret, NULL, NULL);
+}
+#else
+#include <netinet/tcp.h>
+static void set_keepalive(int s) {
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+    int idle = 60;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE,  &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int intvl = 10;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int cnt = 5;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT,   &cnt, sizeof(cnt));
+#endif
+}
+#endif
+
 /* ===================================================================== */
 /*  Constants                                                            */
 /* ===================================================================== */
@@ -479,12 +516,14 @@ typedef int (*write_fn)(void *ctx, const char *buf, int len);
 #define CLUSTER_UNVISITED -1
 #define CLUSTER_NOISE     -2
 
-static void vec_cluster(float eps, int min_pts, int mode, write_fn writer, void *wctx) {
+static int vec_cluster(float eps, int min_pts, int mode, write_fn writer, void *wctx) {
     int n = g_count;
     int alive = n - g_deleted;
     if (alive <= 0) {
-        writer(wctx, "end\n", 4);
-        return;
+        unsigned int zero = 0;
+        writer(wctx, (const char *)&zero, 4); /* cluster_count = 0 */
+        writer(wctx, (const char *)&zero, 4); /* noise_count   = 0 */
+        return 0;
     }
 
     float eps_sq = (mode == 1) ? eps : eps * eps;
@@ -550,47 +589,66 @@ static void vec_cluster(float eps, int min_pts, int mode, write_fn writer, void 
         cluster++;
     }
 
-    char line[256];
-    int line_len;
+    /* Build binary response (see PROTOCOL-2.0.md §3.0x0D):
+     *   <4B cluster_count>
+     *   for each cluster: <4B member_count><member_count×4B idx><dim×4B centroid>
+     *   <4B noise_count><noise_count×4B idx>
+     */
+    int *member_count = (int *)calloc((size_t)cluster, sizeof(int));
+    int noise_count = 0;
+    if (cluster > 0 && !member_count) {
+        free(cluster_id); free(queue); free(dists_buf);
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!g_alive[i]) continue;
+        int cid = cluster_id[i];
+        if (cid == CLUSTER_NOISE) noise_count++;
+        else if (cid >= 0 && cid < cluster) member_count[cid]++;
+    }
+
+    float *centroid = (g_dim > 0 && cluster > 0) ? (float *)malloc((size_t)g_dim * sizeof(float)) : NULL;
+    if (cluster > 0 && !centroid) {
+        free(member_count); free(cluster_id); free(queue); free(dists_buf);
+        return -1;
+    }
+
+    unsigned int ucluster = (unsigned int)cluster;
+    writer(wctx, (const char *)&ucluster, 4);
 
     for (int c = 0; c < cluster; c++) {
-        int first = 1;
+        unsigned int mc = (unsigned int)member_count[c];
+        writer(wctx, (const char *)&mc, 4);
+
+        memset(centroid, 0, (size_t)g_dim * sizeof(float));
         for (int i = 0; i < n; i++) {
             if (cluster_id[i] != c) continue;
-            const char *lbl = (i < g_labels_cap) ? g_labels[i] : NULL;
-            if (lbl)
-                line_len = snprintf(line, sizeof(line), "%s%s", first ? "" : ",", lbl);
-            else
-                line_len = snprintf(line, sizeof(line), "%s%d", first ? "" : ",", i);
-            writer(wctx, line, line_len);
-            first = 0;
+            int idx = i;
+            writer(wctx, (const char *)&idx, 4);
+            const float *v = (const float *)d_vectors + (size_t)i * g_dim;
+            for (int d = 0; d < g_dim; d++) centroid[d] += v[d];
         }
-        writer(wctx, "\n", 1);
+        if (member_count[c] > 0) {
+            float inv = 1.0f / (float)member_count[c];
+            for (int d = 0; d < g_dim; d++) centroid[d] *= inv;
+        }
+        writer(wctx, (const char *)centroid, g_dim * (int)sizeof(float));
     }
 
-    {
-        int first = 1;
-        int has_noise = 0;
-        for (int i = 0; i < n; i++) {
-            if (cluster_id[i] != CLUSTER_NOISE || !g_alive[i]) continue;
-            has_noise = 1;
-            const char *lbl = (i < g_labels_cap) ? g_labels[i] : NULL;
-            if (lbl)
-                line_len = snprintf(line, sizeof(line), "%s%s", first ? "" : ",", lbl);
-            else
-                line_len = snprintf(line, sizeof(line), "%s%d", first ? "" : ",", i);
-            writer(wctx, line, line_len);
-            first = 0;
-        }
-        if (has_noise) writer(wctx, "\n", 1);
+    unsigned int unoise = (unsigned int)noise_count;
+    writer(wctx, (const char *)&unoise, 4);
+    for (int i = 0; i < n; i++) {
+        if (cluster_id[i] != CLUSTER_NOISE || !g_alive[i]) continue;
+        int idx = i;
+        writer(wctx, (const char *)&idx, 4);
     }
 
-    line_len = snprintf(line, sizeof(line), "end\n");
-    writer(wctx, line, line_len);
-
+    free(centroid);
+    free(member_count);
     free(cluster_id);
     free(queue);
     free(dists_buf);
+    return 0;
 }
 
 /* ===================================================================== */
@@ -1336,7 +1394,11 @@ static int process_binary_frame(unsigned char cmd, const char *label, int label_
         if (mode > METRIC_COSINE) { resp_err(writer, wctx, "bad metric"); return 0; }
         if (min_pts < 1) min_pts = 1;
         scratch_writer_ctx sctx; scratch_writer_init(&sctx);
-        vec_cluster(eps, min_pts, mode, scratch_writer_fn, &sctx);
+        int rc = vec_cluster(eps, min_pts, mode, scratch_writer_fn, &sctx);
+        if (rc != 0 || sctx.oom) {
+            scratch_writer_free(&sctx);
+            resp_err(writer, wctx, "out of memory"); return 0;
+        }
         resp_ok_header(writer, wctx, sctx.len);
         if (sctx.len > 0) writer(wctx, sctx.buf, (int)sctx.len);
         scratch_writer_free(&sctx);
@@ -2021,6 +2083,7 @@ static int run_router(int port, int from_deploy = 0) {
     while (1) {
         SOCKET client = accept(listen_sock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
+        set_keepalive(client);
         SOCKET *ps = (SOCKET *)malloc(sizeof(SOCKET));
         *ps = client;
         CreateThread(NULL, 0, router_client_thread, ps, 0, NULL);
@@ -2217,6 +2280,7 @@ static int run_router(int port, int from_deploy = 0) {
     while (1) {
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) continue;
+        set_keepalive(client);
         int *pc = (int *)malloc(sizeof(int));
         *pc = client;
         pthread_t t;
@@ -2690,6 +2754,7 @@ static DWORD WINAPI tcp_listener_thread(LPVOID param) {
         if (sel <= 0) continue;
         SOCKET client = accept(listen_sock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
+        set_keepalive(client);
         SOCKET *ps = (SOCKET *)malloc(sizeof(SOCKET));
         *ps = client;
         CreateThread(NULL, 0, tcp_client_thread, ps, 0, NULL);
@@ -3570,6 +3635,7 @@ static void *tcp_listener_thread(void *param) {
         if (select(listen_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) continue;
+        set_keepalive(client);
         int *pc = (int *)malloc(sizeof(int));
         *pc = client;
         pthread_t t;

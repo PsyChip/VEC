@@ -4,10 +4,14 @@ VEC 2.0 Python Client SDK (binary frame protocol)
 VEC 2.0 is a clean break from 1.x. SDKs from 1.x are not wire-compatible.
 See PROTOCOL-2.0.md for the full spec.
 
+Local transport only in this version:
+    - Windows: named pipe  \\\\.\\pipe\\vec_<name>
+    - Linux:   unix socket /tmp/vec_<name>.sock
+
 Usage:
     from vec_client import VecClient, SHAPE_VECTOR, SHAPE_LABEL, SHAPE_DATA, SHAPE_FULL
 
-    vec = VecClient("localhost", 1920)
+    vec = VecClient("tools")
 
     # Push: vector required; data requires a label
     idx = vec.push([0.1, 0.2, 0.3])
@@ -40,14 +44,12 @@ Usage:
     saved, crc = vec.save()
     info = vec.info()                           # includes 'protocol' (= 2)
 
-    # Clustering still works; CLUSTER body is legacy text inside binary envelope
+    # Clustering: returns list of {'members', 'centroid'} dicts + noise indices
     clusters, noise = vec.cluster(0.5)
-
-Router mode:
-    vec = VecClient("localhost", 1920, namespace="tools")
 """
 import socket
 import struct
+import sys
 import numpy as np
 
 BIN_MAGIC        = 0xF0
@@ -112,11 +114,43 @@ class VecRecord:
         return "VecRecord(" + ", ".join(parts) + ")"
 
 
+class _PipeTransport:
+    """Windows named-pipe transport with the subset of socket methods we use."""
+    def __init__(self, path):
+        # Open a duplex handle on the named pipe. Buffered I/O is fine — frames
+        # are short and we always read a fixed number of bytes per response.
+        self._fh = open(path, "r+b", buffering=0)
+
+    def sendall(self, data):
+        self._fh.write(data)
+        self._fh.flush()
+
+    def recv(self, n):
+        return self._fh.read(n)
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+def _open_local(name):
+    """Connect to the per-DB pipe (Windows) or unix socket (Linux)."""
+    if sys.platform == "win32":
+        return _PipeTransport(r"\\.\pipe\vec_" + name)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect("/tmp/vec_%s.sock" % name)
+    return s
+
+
 class VecClient:
-    def __init__(self, host="localhost", port=1920, namespace=None):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((host, port))
-        self._ns = namespace.encode() if namespace else b""
+    def __init__(self, name):
+        if not name or not isinstance(name, str):
+            raise VecError("VecClient: name is required")
+        self.name = name
+        self.sock = _open_local(name)
+        self._ns = b""  # reserved for router mode in a later version
         self._dim_cache = None
 
     # ---------- low-level wire helpers ----------
@@ -377,11 +411,33 @@ class VecClient:
     # wrapped in the 2.0 binary envelope. Decoded here for convenience.
 
     def cluster(self, eps, cosine=False, min_pts=2):
-        """DBSCAN. Returns (clusters, noise). Each is list[list[str]] of label-or-index strings."""
+        """DBSCAN clustering.
+
+        Returns ``(clusters, noise)``:
+          - ``clusters``: list of dicts ``{'members': [int, ...], 'centroid': np.ndarray}``.
+            The centroid is the unweighted mean of the cluster's member vectors
+            (fp32 even when the DB is f16). Useful for spotting degenerate-
+            attractor clusters: a centroid with suspiciously small magnitude, or
+            a cluster whose members have high pairwise distance, often holds
+            fallback/low-confidence embeddings rather than a real coherent group.
+          - ``noise``: list of int indices.
+        """
         body = struct.pack("<fBi", float(eps), 1 if cosine else 0, int(min_pts))
         self._send_frame(CMD_CLUSTER, body=body)
-        text = self._recv_response().decode("utf-8", errors="replace")
-        return self._parse_text_lines_with_end(text)
+        resp = self._recv_response()
+        dim = self._dim()
+        off = 0
+        (cluster_count,) = struct.unpack_from("<I", resp, off); off += 4
+        clusters = []
+        for _ in range(cluster_count):
+            (mc,) = struct.unpack_from("<I", resp, off); off += 4
+            members = list(struct.unpack_from("<%di" % mc, resp, off)); off += 4 * mc
+            centroid = np.frombuffer(resp, dtype=np.float32, count=dim, offset=off).copy()
+            off += dim * 4
+            clusters.append({"members": members, "centroid": centroid})
+        (noise_count,) = struct.unpack_from("<I", resp, off); off += 4
+        noise = list(struct.unpack_from("<%di" % noise_count, resp, off)) if noise_count else []
+        return clusters, noise
 
     def distinct(self, k, cosine=False):
         """Farthest-point sampling. CPU build returns 'not available' error."""

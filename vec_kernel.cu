@@ -100,7 +100,7 @@ extern "C" void launch_f32_to_f16(const float *src, void *dst, int count) {
 /*  GPU top-K: find K smallest distances                                 */
 /* ===================================================================== */
 
-#define TOPK_K 10
+#define TOPK_K 16
 #define TOPK_THREADS 32
 
 /* insert (dist, id) into a sorted descending buffer of size K */

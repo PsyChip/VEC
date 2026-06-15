@@ -4,11 +4,14 @@
   VEC 2.0 is a clean break from 1.x. SDKs from 1.x are not wire-compatible.
   See PROTOCOL-2.0.md for the full spec.
 
+  Local transport only in this version (Windows named pipe):
+    \\.\pipe\vec_<name>
+
   Usage:
     var Vec: TVecClient;
     var Recs: TVecRecords;
     Vec := TVecClient.Create;
-    Vec.ConnectTCP('localhost', 1920);
+    Vec.Connect('tools');
 
     // Push: vector required; data requires a label
     idx := Vec.Push(myVector);
@@ -36,18 +39,13 @@
     info := Vec.Info;               // info.ProtocolVersion = 2
 
     Vec.Free;
-
-  Router mode:
-    Vec.Namespace := 'tools';
-
-  Works with TCP (all platforms) and Named Pipes (Windows only).
 }
 unit vec_client;
 
 interface
 
 uses
-  Windows, WinSock, SysUtils;
+  Windows, SysUtils;
 
 const
   VEC_BIN_MAGIC        = $F0;
@@ -120,13 +118,25 @@ type
     ProtocolVersion : Integer;
   end;
 
+  TIntArray = array of Integer;
+
+  TVecCluster = record
+    Members  : TIntArray;     { slot indices }
+    Centroid : TSingleArray;  { arithmetic mean of member vectors, fp32 }
+  end;
+
+  TVecClusters = array of TVecCluster;
+
+  TVecClusterResult = record
+    Clusters : TVecClusters;
+    Noise    : TIntArray;
+  end;
+
   TVecClient = class
   private
-    FSocket: TSocket;
     FConnected: Boolean;
-    FUsePipe: Boolean;
     FPipeHandle: THandle;
-    FNamespace: string;
+    FNamespace: AnsiString;  { reserved for router mode in a later version }
     FDimCache: Integer;
     procedure SendRaw(const Data: Pointer; Len: Integer);
     procedure RecvExact(Buf: Pointer; Len: Integer);
@@ -137,8 +147,7 @@ type
     function EnsureDim: Integer;
   public
     constructor Create; overload;
-    function ConnectTCP(const Host: string; Port: Integer = 1920): Boolean;
-    function ConnectPipe(const Name: string): Boolean;
+    function Connect(const Name: string): Boolean;
 
     function Push(const Vec: TSingleArray): Integer;
     function PushLabeled(const ALabel: string; const Vec: TSingleArray): Integer;
@@ -173,14 +182,13 @@ type
     procedure Save; overload;
     function Info: TVecInfo;
 
-    function ClusterRaw(Eps: Single; Cosine: Boolean = False; MinPts: Integer = 2): TArray<string>;
+    function Cluster(Eps: Single; Cosine: Boolean = False; MinPts: Integer = 2): TVecClusterResult;
     function DistinctRaw(K: Integer; Cosine: Boolean = False): TArray<string>;
     function RepresentRaw(Eps: Single; Cosine: Boolean = False; MinPts: Integer = 2): TArray<string>;
 
     procedure Close;
     destructor Destroy; override;
     property Connected: Boolean read FConnected;
-    property Namespace: string read FNamespace write FNamespace;
   end;
 
 implementation
@@ -188,104 +196,45 @@ implementation
 constructor TVecClient.Create;
 begin
   inherited;
-  FSocket := INVALID_SOCKET;
   FConnected := False;
-  FUsePipe := False;
   FPipeHandle := INVALID_HANDLE_VALUE;
   FNamespace := '';
   FDimCache := 0;
 end;
 
-function TVecClient.ConnectTCP(const Host: string; Port: Integer): Boolean;
-var
-  WSA: TWSAData;
-  Addr: TSockAddrIn;
-  HostEnt: PHostEnt;
-begin
-  Result := False;
-  WSAStartup(MakeWord(2, 2), WSA);
-
-  FSocket := WinSock.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if FSocket = INVALID_SOCKET then Exit;
-
-  FillChar(Addr, SizeOf(Addr), 0);
-  Addr.sin_family := AF_INET;
-  Addr.sin_port := htons(Port);
-  Addr.sin_addr.S_addr := inet_addr(PAnsiChar(AnsiString(Host)));
-
-  if Addr.sin_addr.S_addr = INADDR_NONE then begin
-    HostEnt := gethostbyname(PAnsiChar(AnsiString(Host)));
-    if HostEnt = nil then begin
-      closesocket(FSocket);
-      FSocket := INVALID_SOCKET;
-      Exit;
-    end;
-    Move(HostEnt^.h_addr_list^[0], Addr.sin_addr.S_addr, HostEnt^.h_length);
-  end;
-
-  if WinSock.connect(FSocket, Addr, SizeOf(Addr)) <> 0 then begin
-    closesocket(FSocket);
-    FSocket := INVALID_SOCKET;
-    Exit;
-  end;
-
-  FConnected := True;
-  FUsePipe := False;
-  Result := True;
-end;
-
-function TVecClient.ConnectPipe(const Name: string): Boolean;
+function TVecClient.Connect(const Name: string): Boolean;
 var
   PipeName: string;
 begin
   Result := False;
+  if Name = '' then Exit;
   PipeName := '\\.\pipe\vec_' + Name;
   FPipeHandle := CreateFileA(PAnsiChar(AnsiString(PipeName)),
     GENERIC_READ or GENERIC_WRITE, 0, nil, OPEN_EXISTING, 0, 0);
   if FPipeHandle = INVALID_HANDLE_VALUE then Exit;
   FConnected := True;
-  FUsePipe := True;
   Result := True;
 end;
 
 procedure TVecClient.SendRaw(const Data: Pointer; Len: Integer);
 var
   Written: DWORD;
-  Sent, R: Integer;
 begin
   if Len <= 0 then Exit;
-  if FUsePipe then begin
-    WriteFile(FPipeHandle, Data^, Len, Written, nil);
-  end else begin
-    Sent := 0;
-    while Sent < Len do begin
-      R := WinSock.send(FSocket, PAnsiChar(Data)[Sent], Len - Sent, 0);
-      if R <= 0 then Break;
-      Inc(Sent, R);
-    end;
-  end;
+  WriteFile(FPipeHandle, Data^, Len, Written, nil);
 end;
 
 procedure TVecClient.RecvExact(Buf: Pointer; Len: Integer);
 var
   BytesRead: DWORD;
-  Got, R: Integer;
+  Got: Integer;
 begin
   if Len <= 0 then Exit;
-  if FUsePipe then begin
-    Got := 0;
-    while Got < Len do begin
-      ReadFile(FPipeHandle, PAnsiChar(Buf)[Got], Len - Got, BytesRead, nil);
-      if BytesRead = 0 then Break;
-      Inc(Got, BytesRead);
-    end;
-  end else begin
-    Got := 0;
-    while Got < Len do begin
-      R := recv(FSocket, PAnsiChar(Buf)[Got], Len - Got, 0);
-      if R <= 0 then Break;
-      Inc(Got, R);
-    end;
+  Got := 0;
+  while Got < Len do begin
+    ReadFile(FPipeHandle, PAnsiChar(Buf)[Got], Len - Got, BytesRead, nil);
+    if BytesRead = 0 then Break;
+    Inc(Got, BytesRead);
   end;
 end;
 
@@ -297,7 +246,7 @@ var
   BodyLen: Cardinal;
   Off: Integer;
 begin
-  if FNamespace <> '' then NS := AnsiString(FNamespace) else NS := '';
+  NS := FNamespace;
   NSLen := Length(NS);
   LblLen := Length(ALabel);
   if LblLen > VEC_MAX_LABEL_BYTES then
@@ -742,9 +691,21 @@ end;
 
 { ---------------- CLUSTER / DISTINCT / REPRESENT (legacy text bodies) ---------------- }
 
-function TVecClient.ClusterRaw(Eps: Single; Cosine: Boolean; MinPts: Integer): TArray<string>;
-var Body, R: AnsiString; Mode: Byte; Lines: TArray<string>; SS: TArray<string>; I: Integer;
+{ DBSCAN clustering. The centroid of each cluster is the arithmetic mean of
+  its member vectors (fp32 even for f16 DBs). Use it to spot degenerate-
+  attractor clusters: a centroid with suspiciously small magnitude, or members
+  with high pairwise distance, often holds low-confidence/fallback embeddings
+  rather than a real coherent group. }
+function TVecClient.Cluster(Eps: Single; Cosine: Boolean; MinPts: Integer): TVecClusterResult;
+var
+  Body, R: AnsiString;
+  Mode: Byte;
+  Dim: Integer;
+  CCount, MCount, NCount: Cardinal;
+  Off: Integer;
+  C, I: Integer;
 begin
+  Dim := EnsureDim;
   SetLength(Body, 9);
   Move(Eps, Body[1], 4);
   if Cosine then Mode := VEC_METRIC_COSINE else Mode := VEC_METRIC_L2;
@@ -752,14 +713,29 @@ begin
   Move(MinPts, Body[6], 4);
   SendFrame(VEC_CMD_CLUSTER, '', Body);
   R := RecvResponse;
-  SS := string(R).Split([#10]);
-  SetLength(Lines, 0);
-  for I := 0 to Length(SS) - 1 do begin
-    if (SS[I] = '') or (SS[I] = 'end') then Continue;
-    SetLength(Lines, Length(Lines) + 1);
-    Lines[High(Lines)] := SS[I];
+
+  Off := 1; { 1-based AnsiString indexing }
+  Move(R[Off], CCount, 4); Inc(Off, 4);
+  SetLength(Result.Clusters, CCount);
+  for C := 0 to Integer(CCount) - 1 do begin
+    Move(R[Off], MCount, 4); Inc(Off, 4);
+    SetLength(Result.Clusters[C].Members, MCount);
+    for I := 0 to Integer(MCount) - 1 do begin
+      Move(R[Off], Result.Clusters[C].Members[I], 4);
+      Inc(Off, 4);
+    end;
+    SetLength(Result.Clusters[C].Centroid, Dim);
+    if Dim > 0 then begin
+      Move(R[Off], Result.Clusters[C].Centroid[0], Dim * SizeOf(Single));
+      Inc(Off, Dim * SizeOf(Single));
+    end;
   end;
-  Result := Lines;
+  Move(R[Off], NCount, 4); Inc(Off, 4);
+  SetLength(Result.Noise, NCount);
+  for I := 0 to Integer(NCount) - 1 do begin
+    Move(R[Off], Result.Noise[I], 4);
+    Inc(Off, 4);
+  end;
 end;
 
 function TVecClient.DistinctRaw(K: Integer; Cosine: Boolean): TArray<string>;
@@ -803,14 +779,10 @@ end;
 
 procedure TVecClient.Close;
 begin
-  if FUsePipe and (FPipeHandle <> INVALID_HANDLE_VALUE) then begin
+  if FPipeHandle <> INVALID_HANDLE_VALUE then begin
     FlushFileBuffers(FPipeHandle);
     CloseHandle(FPipeHandle);
     FPipeHandle := INVALID_HANDLE_VALUE;
-  end;
-  if (not FUsePipe) and (FSocket <> INVALID_SOCKET) then begin
-    closesocket(FSocket);
-    FSocket := INVALID_SOCKET;
   end;
   FConnected := False;
 end;

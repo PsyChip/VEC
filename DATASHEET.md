@@ -10,7 +10,7 @@
 | `0x08` | **CMD_LABEL** | Set or clear label for slot (via header; len=0 clears) | `<4B i32 idx>` | empty | `bad body length` · `index out of range` · `label too long` · `label has invalid chars` · `label empty` · `read-only mode` |
 | `0x09` | **UNDO** | Remove last PUSH; also frees its label + data | empty | empty | `extra body bytes` · `empty` · `read-only mode` |
 | `0x0A` | **SAVE** | Flush `.tensors` + `.meta` + `.hashes` + `.data` to disk | empty | `<4B u32 saved><4B u32 crc32>` | `extra body bytes` · `read-only mode` |
-| `0x0D` | **CLUSTER** | DBSCAN clustering | `<4B f32 eps><1B mode><4B i32 min_pts>` | legacy text body: members per line + `end\n` | `bad body length` · `invalid eps` · `bad metric` |
+| `0x0D` | **CLUSTER** | DBSCAN clustering | `<4B f32 eps><1B mode><4B i32 min_pts>` | `<4B u32 cluster_count>` then per cluster: `<4B u32 member_count><member_count×i32 idx><dim×f32 centroid>`, then `<4B u32 noise_count><noise_count×i32 idx>` | `bad body length` · `invalid eps` · `bad metric` · `out of memory` |
 | `0x0E` | **DISTINCT** | Farthest-point sampling | `<4B i32 k><1B mode>` | legacy text body: one index per line + `end\n` | `bad body length` · `invalid k` · `bad metric` · `distinct not available in cpu mode` |
 | `0x0F` | **REPRESENT** | One most-distinct member per DBSCAN cluster | `<4B f32 eps><1B mode><4B i32 min_pts>` | legacy text body: one index per line + `end\n` | `bad body length` · `invalid eps` · `bad metric` · `represent not available in cpu mode` |
 | `0x10` | **INFO** | DB metadata snapshot | empty | `<4B dim><4B count><4B deleted><1B fmt><8B mtime><4B crc><1B crc_ok><4B name_len>[name]<1B protocol=0x02>` | `extra body bytes` · `out of memory` |

@@ -4,11 +4,14 @@ Binary client libraries for `vec` (GPU) and `vec-cpu` (CPU). VEC 2.0 is a clean 
 
 ## Transport
 
-| Method | Address |
+SDKs in this version are **local-only**:
+
+| OS | Address |
 |--------|---------|
-| TCP | `host:port` (default 1920) |
-| Named pipe | `\\.\pipe\vec_<name>` (Windows) |
-| Unix socket | `/tmp/vec_<name>.sock` (Linux) |
+| Windows | named pipe `\\.\pipe\vec_<name>` |
+| Linux | unix socket `/tmp/vec_<name>.sock` |
+
+The constructor takes the DB name and picks the right address for the host OS. Remote (TCP) and router/namespace mode will return in a later SDK version — the server already supports them; only the client surface is local-only for now.
 
 ## Frame envelope
 
@@ -76,7 +79,7 @@ A response body is `<4B u32 count>` followed by `count` records.
 | LABEL | `08` | `<4B idx>` (label in header) | empty |
 | UNDO | `09` | empty | empty |
 | SAVE | `0A` | empty | `<4B u32 saved><4B u32 crc>` |
-| CLUSTER | `0D` | `<4B f32 eps><1B mode><4B i32 min_pts>` | legacy text body (lines + `end\n`) |
+| CLUSTER | `0D` | `<4B f32 eps><1B mode><4B i32 min_pts>` | `<4B count>` then per cluster `<4B mc><mc×i32 idx><dim×f32 centroid>`, then `<4B noise_count><noise×i32 idx>` |
 | DISTINCT | `0E` | `<4B i32 k><1B mode>` | legacy text body |
 | REPRESENT | `0F` | `<4B f32 eps><1B mode><4B i32 min_pts>` | legacy text body |
 | INFO | `10` | empty | see below |
@@ -146,6 +149,7 @@ Read-only rejects: PUSH, UPDATE, DELETE, LABEL, UNDO, SAVE, SET_DATA.
 | `vec_client.h` | C++ (header-only) | 2.0 |
 | `vec_client.py` | Python 3 (numpy) | 2.0 |
 | `vec_client.js` | Node.js | 2.0 |
+| `vec_client.d.ts` | TypeScript declarations (pair with `vec_client.js`) | 2.0 |
 | `vec_client.pas` | Delphi | 2.0 |
 
 All clients expose:
@@ -158,10 +162,6 @@ All clients expose:
 - `set_label(idx, label)` / `delete(idx_or_label)` / `undo()`
 - `save() → (count, crc)` / `info() → metadata`
 - `cluster(eps)` / `distinct(k)` / `represent(eps)` (DISTINCT/REPRESENT are CPU-build stubs)
-
-## Router
-
-`vec --route` or `vec deploy` mode. Set namespace on the client; SDK encodes it in `ns_len`/`ns` fields. Router strips the namespace and forwards to the matching backend pipe/socket. The 2.0 `body_len` is preserved across forwarding.
 
 ## File format
 

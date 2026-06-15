@@ -4,9 +4,13 @@
  * VEC 2.0 is a clean break from 1.x. SDKs from 1.x are not wire-compatible.
  * See PROTOCOL-2.0.md for the full spec.
  *
+ * Local transport only in this version:
+ *   - Windows: named pipe  \\.\pipe\vec_<name>
+ *   - Linux:   unix socket /tmp/vec_<name>.sock
+ *
  * Usage:
  *   const VecClient = require('./vec_client');
- *   const vec = new VecClient('localhost', 1920);
+ *   const vec = new VecClient('tools');
  *   await vec.connect();
  *
  *   // Push: vector required; data requires a label
@@ -40,9 +44,6 @@
  *   const info = await vec.info();              // .protocol === 2
  *
  *   const { clusters, noise } = await vec.cluster(0.5);
- *
- * Router mode:
- *   const vec = new VecClient('localhost', 1920, 'tools');
  */
 const net = require('net');
 
@@ -84,19 +85,28 @@ const MAX_LABEL_BYTES = 2048;
 const MAX_DATA_BYTES  = 102400;
 
 class VecClient {
-    constructor(host = 'localhost', port = 1920, namespace = null) {
-        this.host = host;
-        this.port = port;
+    constructor(name) {
+        if (!name || typeof name !== 'string') {
+            throw new Error('VecClient: name is required');
+        }
+        this.name = name;
         this.sock = null;
         this.buffer = Buffer.alloc(0);
         this.pending = [];
-        this._ns = namespace ? Buffer.from(namespace) : Buffer.alloc(0);
+        this._ns = Buffer.alloc(0); // reserved for router mode in a later version
         this._dimCache = null;
+    }
+
+    _localPath() {
+        return process.platform === 'win32'
+            ? `\\\\.\\pipe\\vec_${this.name}`
+            : `/tmp/vec_${this.name}.sock`;
     }
 
     connect() {
         return new Promise((resolve, reject) => {
-            this.sock = net.createConnection(this.port, this.host, () => resolve());
+            const onConnect = () => resolve();
+            this.sock = net.createConnection(this._localPath(), onConnect);
             this.sock.on('error', reject);
             this.sock.on('data', (data) => {
                 this.buffer = Buffer.concat([this.buffer, data]);
@@ -370,6 +380,13 @@ class VecClient {
         return Buffer.from(body.subarray(4, 4 + dlen));
     }
 
+    /**
+     * DBSCAN clustering. Returns { clusters: [{ members: int[], centroid: Float32Array }], noise: int[] }.
+     * The centroid is the unweighted mean of the cluster's member vectors (fp32 on the wire
+     * even when the DB is f16). Useful for spotting degenerate-attractor clusters: a centroid
+     * with suspiciously small magnitude, or a cluster whose members have high pairwise distance,
+     * often holds fallback/low-confidence embeddings rather than a real coherent group.
+     */
     async cluster(eps, opts = {}) {
         const { cosine = false, minPts = 2 } = opts;
         const data = Buffer.alloc(9);
@@ -377,15 +394,28 @@ class VecClient {
         data[4] = cosine ? METRIC_COSINE : METRIC_L2;
         data.writeInt32LE(minPts, 5);
         this._sendFrame(CMD_CLUSTER, Buffer.alloc(0), data);
-        const text = (await this._recvResponse()).toString('utf8');
-        const lines = [];
-        for (const raw of text.split('\n')) {
-            const line = raw.trim();
-            if (!line || line === 'end') continue;
-            lines.push(line.split(',').filter(m => m));
+        const body = await this._recvResponse();
+        const dim = await this._dim();
+        let off = 0;
+        const clusterCount = body.readUInt32LE(off); off += 4;
+        const clusters = [];
+        for (let c = 0; c < clusterCount; c++) {
+            const memberCount = body.readUInt32LE(off); off += 4;
+            const members = new Array(memberCount);
+            for (let i = 0; i < memberCount; i++) {
+                members[i] = body.readInt32LE(off); off += 4;
+            }
+            const slice = body.subarray(off, off + dim * 4);
+            const centroid = new Float32Array(new Uint8Array(slice).buffer);
+            off += dim * 4;
+            clusters.push({ members, centroid });
         }
-        const noise = lines.length > 0 ? lines.pop() : [];
-        return { clusters: lines, noise };
+        const noiseCount = body.readUInt32LE(off); off += 4;
+        const noise = new Array(noiseCount);
+        for (let i = 0; i < noiseCount; i++) {
+            noise[i] = body.readInt32LE(off); off += 4;
+        }
+        return { clusters, noise };
     }
 
     async distinct(k, opts = {}) {
