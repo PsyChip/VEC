@@ -533,29 +533,6 @@ static int validate_label(const char *label, int len) {
 }
 
 /* set label without validation — used by .meta load (lenient, matches 1.x) */
-static void vec_set_label_raw(int slot, const char *label, int len) {
-    if (slot < 0 || slot >= g_labels_cap) return;
-    free(g_labels[slot]);
-    if (!label || len <= 0) { g_labels[slot] = NULL; return; }
-
-    /* strip UTF-8 BOM */
-    if (len >= 3 && (unsigned char)label[0] == 0xEF &&
-        (unsigned char)label[1] == 0xBB && (unsigned char)label[2] == 0xBF) {
-        label += 3; len -= 3;
-    }
-    if (len <= 0) { g_labels[slot] = NULL; return; }
-
-    char *buf = (char *)malloc(len + 1);
-    if (!buf) {
-        fprintf(stderr, "ERROR: out of CPU memory storing label (len=%d), label dropped\n", len);
-        g_labels[slot] = NULL;
-        return;
-    }
-    memcpy(buf, label, len);
-    buf[len] = '\0';
-    g_labels[slot] = buf;
-}
-
 /* set label with strict validation — used by all wire write paths (PUSH, CMD_LABEL).
  * returns 0 on success, validate_label() error codes otherwise. on error, prior label is unchanged. */
 static int vec_set_label(int slot, const char *label, int len) {
@@ -1803,23 +1780,6 @@ static int load_from_file() {
 /* ===================================================================== */
 
 /* format results: label:dist or index:dist per result, comma-separated */
-static void format_results(int *ids, float *dists, int k, write_fn writer, void *wctx) {
-    char resp[65536];
-    char *p = resp;
-    int rem = sizeof(resp) - 2;
-    for (int i = 0; i < k; i++) {
-        int w;
-        const char *lbl = (ids[i] < g_labels_cap) ? g_labels[ids[i]] : NULL;
-        if (lbl)
-            w = snprintf(p, rem, "%s%s:%.6f", i > 0 ? "," : "", lbl, dists[i]);
-        else
-            w = snprintf(p, rem, "%s%d:%.6f", i > 0 ? "," : "", ids[i], dists[i]);
-        p += w; rem -= w;
-    }
-    *p++ = '\n';
-    writer(wctx, resp, (int)(p - resp));
-}
-
 /* ===================================================================== */
 /*  Binary frame protocol                                                */
 /* ===================================================================== */
@@ -1891,30 +1851,6 @@ static void bin_write_vec_ensure(int dim) {
     g_bwv_f32 = (float *)malloc(dim * sizeof(float));
     g_bwv_f16 = (unsigned short *)malloc(dim * sizeof(unsigned short));
     g_bwv_dim = dim;
-}
-
-/* write one vector from GPU to client as raw fp32 (handles f16 decode) */
-static int bin_write_vec(int idx, write_fn writer, void *wctx) {
-    bin_write_vec_ensure(g_dim);
-    if (!g_bwv_f32) { fprintf(stderr, "ERROR: out of CPU memory in bin_write_vec (dim=%d)\n", g_dim); return -1; }
-    if (g_fmt == FMT_F32) {
-        CUDA_CHECK(cudaMemcpy(g_bwv_f32, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim * sizeof(float), cudaMemcpyDeviceToHost));
-    } else {
-        CUDA_CHECK(cudaMemcpy(g_bwv_f16, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim * sizeof(unsigned short), cudaMemcpyDeviceToHost));
-        for (int d = 0; d < g_dim; d++) {
-            unsigned int bits = g_bwv_f16[d];
-            unsigned int sign = (bits >> 15) & 1;
-            unsigned int exp = (bits >> 10) & 0x1F;
-            unsigned int mant = bits & 0x3FF;
-            unsigned int f32;
-            if (exp == 0) f32 = sign << 31;
-            else if (exp == 31) f32 = (sign << 31) | 0x7F800000 | (mant << 13);
-            else f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-            memcpy(&g_bwv_f32[d], &f32, sizeof(float));
-        }
-    }
-    writer(wctx, (const char *)g_bwv_f32, g_dim * (int)sizeof(float));
-    return 0;
 }
 
 /* resolve label to a single index, -1 if not found, -2 if ambiguous */
@@ -2515,38 +2451,6 @@ static void build_filepath() {
     snprintf(g_filepath, sizeof(g_filepath), "%s_%d_%s.tensors", g_name, g_dim, fmt_name(g_fmt));
 }
 
-static int parse_tensors_filename(const char *filename) {
-    const char *base = filename;
-    const char *p = filename;
-    while (*p) {
-        if (*p == '\\' || *p == '/') base = p + 1;
-        p++;
-    }
-    char buf[256];
-    strncpy(buf, base, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    char *ext = strstr(buf, ".tensors");
-    if (!ext) return 0;
-    *ext = '\0';
-
-    char *last_sep = strrchr(buf, '_');
-    if (!last_sep) return 0;
-    *last_sep = '\0';
-    const char *fmt_str = last_sep + 1;
-
-    char *dim_sep = strrchr(buf, '_');
-    if (!dim_sep) return 0;
-    *dim_sep = '\0';
-    const char *dim_str = dim_sep + 1;
-
-    strncpy(g_name, buf, sizeof(g_name) - 1);
-    g_dim = atoi(dim_str);
-    set_format(fmt_str);
-
-    return (g_dim > 0);
-}
-
 /* ===================================================================== */
 /*  Startup / capacity display (shared)                                  */
 /* ===================================================================== */
@@ -2587,6 +2491,15 @@ static void fmt_modified(char *buf, size_t sz, time_t mtime) {
 
 static void print_startup_info(int file_exists, int loaded, double max_records) {
     printf("===================================================================\n");
+    {
+        char cwd_buf[512];
+#ifdef _WIN32
+        GetCurrentDirectoryA((DWORD)sizeof(cwd_buf), cwd_buf);
+#else
+        if (!getcwd(cwd_buf, sizeof(cwd_buf))) strcpy(cwd_buf, "?");
+#endif
+        printf("  path          %s\n", cwd_buf);
+    }
 
     if (file_exists && loaded > 0) {
         char cnt[32], active[32], del[32], cap[32], rem[32], fsz[32];
@@ -2656,7 +2569,8 @@ static void print_startup_info(int file_exists, int loaded, double max_records) 
 /* ===================================================================== */
 
 static void print_help() {
-    printf("vec - dead simple GPU-resident vector database\n\n");
+    printf("vec - dead simple GPU-resident vector database\n");
+    printf("Created by PsyChip (root@psychip.net)\n\n");
     printf("start a database:\n");
     printf("  vec                                  find .tensors in current dir or create new\n");
     printf("  vec mydb 1024                        create/open 1024-dim database\n");
@@ -2671,6 +2585,13 @@ static void print_help() {
     printf("  vec --deploy=a:1024,b:512 1920       explicit schema, custom port\n");
     printf("  vec --notcp tools 1024               pipe/socket only (no TCP)\n");
     printf("  vec --route 1920                     route multiple --notcp instances\n\n");
+    printf("supported GPU architectures:\n");
+    printf("  SM 7.5  (Turing,        RTX 2000/T4)\n");
+    printf("  SM 8.0  (Ampere DC,     A100)\n");
+    printf("  SM 8.6  (Ampere,        RTX 3000/A10/A40)\n");
+    printf("  SM 8.9  (Ada Lovelace,  RTX 4000/L40)\n");
+    printf("  SM 9.0  (Hopper,        H100/H200)\n");
+    printf("  SM 10.0 (Blackwell,     B100/B200/RTX 5000)\n\n");
     printf("housekeeping:\n");
     printf("  vec mydb --delete                    destroy database files\n");
     printf("  vec mydb --check                     verify file integrity (dry run)\n");
@@ -4111,15 +4032,30 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
     return FALSE;
 }
 
-int main(int argc, char **argv) {
-    /* chdir to exe directory so file discovery works from shortcuts */
-    {
-        char exepath[512];
-        GetModuleFileNameA(NULL, exepath, sizeof(exepath));
-        char *last = strrchr(exepath, '\\');
-        if (last) { *last = '\0'; SetCurrentDirectoryA(exepath); }
+static void check_gpu_arch(int major, int minor) {
+    static const int supported[] = { 75, 80, 86, 89, 90, 100 };
+    int cc = major * 10 + minor;
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        if (cc == supported[i]) return;
     }
+    fprintf(stderr, "ERROR: GPU architecture SM %d.%d is not supported.\n", major, minor);
+    fprintf(stderr, "Supported architectures:\n");
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        int sm_major = supported[i] / 10;
+        int sm_minor = supported[i] % 10;
+        fprintf(stderr, "  SM %d.%d", sm_major, sm_minor);
+        if      (supported[i] == 75) fprintf(stderr, " (Turing, RTX 2000/T4)\n");
+        else if (supported[i] == 80) fprintf(stderr, " (Ampere, A100)\n");
+        else if (supported[i] == 86) fprintf(stderr, " (Ampere, RTX 3000/A10/A40)\n");
+        else if (supported[i] == 89) fprintf(stderr, " (Ada, RTX 4000/L40)\n");
+        else if (supported[i] == 90) fprintf(stderr, " (Hopper, H100/H200)\n");
+        else if (supported[i] == 100) fprintf(stderr, " (Blackwell, B100/B200/RTX 5000)\n");
+        else fprintf(stderr, "\n");
+    }
+    exit(1);
+}
 
+int main(int argc, char **argv) {
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
@@ -4311,6 +4247,7 @@ int main(int argc, char **argv) {
     cudaGetDevice(&device);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
+    check_gpu_arch(prop.major, prop.minor);
     double vram_gb = prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0);
     double max_records = (prop.totalGlobalMem * 0.9) / ((double)g_dim * g_elem_size);
 
@@ -4953,20 +4890,6 @@ static void sig_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-    /* chdir to exe directory so file discovery works from symlinks */
-    {
-        char exepath[512] = {0};
-        ssize_t len = readlink("/proc/self/exe", exepath, sizeof(exepath) - 1);
-        if (len <= 0) {
-            char *resolved = realpath(argv[0], NULL);
-            if (resolved) { strncpy(exepath, resolved, sizeof(exepath) - 1); free(resolved); }
-        } else {
-            exepath[len] = '\0';
-        }
-        char *last = strrchr(exepath, '/');
-        if (last) { *last = '\0'; chdir(exepath); }
-    }
-
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
@@ -5155,6 +5078,7 @@ int main(int argc, char **argv) {
     cudaGetDevice(&device);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
+    check_gpu_arch(prop.major, prop.minor);
     double vram_gb = prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0);
     double max_records = (prop.totalGlobalMem * 0.9) / ((double)g_dim * g_elem_size);
 

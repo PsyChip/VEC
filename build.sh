@@ -2,8 +2,11 @@
 echo "[build] compiling vec_kernel.cu..."
 nvcc -O2 -c vec_kernel.cu -o vec_kernel.o \
   -Wno-deprecated-gpu-targets -gencode arch=compute_75,code=sm_75 \
+  -gencode arch=compute_80,code=sm_80 \
   -gencode arch=compute_86,code=sm_86 \
-  -gencode arch=compute_89,code=sm_89 || exit 1
+  -gencode arch=compute_89,code=sm_89 \
+  -gencode arch=compute_90,code=sm_90 \
+  -gencode arch=compute_100,code=sm_100 || exit 1
 
 echo "[build] linking vec..."
 nvcc -O2 vec_kernel.o vec.cpp -o vec -lpthread || exit 1

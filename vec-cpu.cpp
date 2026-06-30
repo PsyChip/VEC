@@ -414,22 +414,6 @@ static int validate_label(const char *label, int len) {
 }
 
 /* lenient label setter — used by .meta load only (matches 1.x). */
-static void vec_set_label_raw(int slot, const char *label, int len) {
-    if (slot < 0 || slot >= g_labels_cap) return;
-    free(g_labels[slot]);
-    if (!label || len <= 0) { g_labels[slot] = NULL; return; }
-    if (len >= 3 && (unsigned char)label[0] == 0xEF &&
-        (unsigned char)label[1] == 0xBB && (unsigned char)label[2] == 0xBF) {
-        label += 3; len -= 3;
-    }
-    if (len <= 0) { g_labels[slot] = NULL; return; }
-    char *buf = (char *)malloc(len + 1);
-    if (!buf) { g_labels[slot] = NULL; return; }
-    memcpy(buf, label, len);
-    buf[len] = '\0';
-    g_labels[slot] = buf;
-}
-
 /* strict label setter — used by all wire write paths. returns 0 ok, validate_label codes on error. */
 static int vec_set_label(int slot, const char *label, int len) {
     if (slot < 0 || slot >= g_labels_cap) return -1;
@@ -935,23 +919,6 @@ static int load_from_file() {
 /* ===================================================================== */
 
 /* format results: label:dist or index:dist per result, comma-separated */
-static void format_results(int *ids, float *dists, int k, write_fn writer, void *wctx) {
-    char resp[65536];
-    char *p = resp;
-    int rem = sizeof(resp) - 2;
-    for (int i = 0; i < k; i++) {
-        int w;
-        const char *lbl = (ids[i] < g_labels_cap) ? g_labels[ids[i]] : NULL;
-        if (lbl)
-            w = snprintf(p, rem, "%s%s:%.6f", i > 0 ? "," : "", lbl, dists[i]);
-        else
-            w = snprintf(p, rem, "%s%d:%.6f", i > 0 ? "," : "", ids[i], dists[i]);
-        p += w; rem -= w;
-    }
-    *p++ = '\n';
-    writer(wctx, resp, (int)(p - resp));
-}
-
 /* ===================================================================== */
 /*  Binary frame protocol                                                */
 /* ===================================================================== */
@@ -982,12 +949,6 @@ static int frame_data_len(unsigned char cmd, const char *data_start, int availab
         default:
             return -2;
     }
-}
-
-/* write one vector from memory to client as raw fp32 — zero-copy from d_vectors */
-static int bin_write_vec(int idx, write_fn writer, void *wctx) {
-    writer(wctx, (char *)d_vectors + (size_t)idx * g_dim * g_elem_size, g_dim * (int)sizeof(float));
-    return 0;
 }
 
 /* ===================================================================== */
@@ -1497,38 +1458,6 @@ static void build_filepath() {
     snprintf(g_filepath, sizeof(g_filepath), "%s_%d_%s.tensors", g_name, g_dim, fmt_name(g_fmt));
 }
 
-static int parse_tensors_filename(const char *filename) {
-    const char *base = filename;
-    const char *p = filename;
-    while (*p) {
-        if (*p == '\\' || *p == '/') base = p + 1;
-        p++;
-    }
-    char buf[256];
-    strncpy(buf, base, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    char *ext = strstr(buf, ".tensors");
-    if (!ext) return 0;
-    *ext = '\0';
-
-    char *last_sep = strrchr(buf, '_');
-    if (!last_sep) return 0;
-    *last_sep = '\0';
-    const char *fmt_str = last_sep + 1;
-
-    char *dim_sep = strrchr(buf, '_');
-    if (!dim_sep) return 0;
-    *dim_sep = '\0';
-    const char *dim_str = dim_sep + 1;
-
-    strncpy(g_name, buf, sizeof(g_name) - 1);
-    g_dim = atoi(dim_str);
-    set_format(fmt_str);
-
-    return (g_dim > 0);
-}
-
 /* ===================================================================== */
 /*  Startup / capacity display (shared)                                  */
 /* ===================================================================== */
@@ -1569,6 +1498,15 @@ static void fmt_modified(char *buf, size_t sz, time_t mtime) {
 
 static void print_startup_info(int file_exists, int loaded, double max_records) {
     printf("===================================================================\n");
+    {
+        char cwd_buf[512];
+#ifdef _WIN32
+        GetCurrentDirectoryA((DWORD)sizeof(cwd_buf), cwd_buf);
+#else
+        if (!getcwd(cwd_buf, sizeof(cwd_buf))) strcpy(cwd_buf, "?");
+#endif
+        printf("  path          %s\n", cwd_buf);
+    }
 
     if (file_exists && loaded > 0) {
         char cnt[32], active[32], del[32], cap[32], rem[32], fsz[32];
@@ -1638,7 +1576,8 @@ static void print_startup_info(int file_exists, int loaded, double max_records) 
 /* ===================================================================== */
 
 static void print_help() {
-    printf("vec-cpu - dead simple memory-resident vector database (no GPU needed)\n\n");
+    printf("vec-cpu - dead simple memory-resident vector database (no GPU needed)\n");
+    printf("Created by PsyChip (root@psychip.net)\n\n");
     printf("start a database:\n");
     printf("  vec-cpu                              find .tensors in current dir or create new\n");
     printf("  vec-cpu mydb 1024                    create/open 1024-dim database\n");
@@ -3050,14 +2989,6 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
 }
 
 int main(int argc, char **argv) {
-    /* chdir to exe directory so file discovery works from shortcuts */
-    {
-        char exepath[512];
-        GetModuleFileNameA(NULL, exepath, sizeof(exepath));
-        char *last = strrchr(exepath, '\\');
-        if (last) { *last = '\0'; SetCurrentDirectoryA(exepath); }
-    }
-
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
@@ -3873,20 +3804,6 @@ static void sig_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-    /* chdir to exe directory so file discovery works from symlinks */
-    {
-        char exepath[512] = {0};
-        ssize_t len = readlink("/proc/self/exe", exepath, sizeof(exepath) - 1);
-        if (len <= 0) {
-            char *resolved = realpath(argv[0], NULL);
-            if (resolved) { strncpy(exepath, resolved, sizeof(exepath) - 1); free(resolved); }
-        } else {
-            exepath[len] = '\0';
-        }
-        char *last = strrchr(exepath, '/');
-        if (last) { *last = '\0'; chdir(exepath); }
-    }
-
     /* flags */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { print_help(); return 0; }
